@@ -59,7 +59,7 @@ eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 device = torch.device('cuda')
 model_name = 'answerdotai/modernbert-base'
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-modernbert = ModernBertModel.from_pretrained(model_name).to(device).half()  # float16
+modernbert = ModernBertModel.from_pretrained(model_name, attn_implementation='eager').to(device).half()  # float16
 modernbert.eval()
 for p in modernbert.parameters():
     p.requires_grad = False

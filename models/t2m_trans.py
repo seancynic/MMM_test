@@ -216,6 +216,7 @@ class Text2Motion_Transformer(nn.Module):
     def forward_function(self, idxs, clip_feature=None, src_mask=None, att_txt=None, word_emb=None, first=None, max_m=None, max_t=None):
         if src_mask is not None:
             src_mask = self.get_attn_mask(src_mask, att_txt)
+            src_mask=src_mask.bool()
         feat = self.trans_base(idxs, clip_feature, src_mask, word_emb, first)
         logits = self.trans_head(feat, src_mask, first, max_m, max_t)
 
@@ -378,7 +379,9 @@ class Text2Motion_Transformer(nn.Module):
                 raise RuntimeError(f'The order of the two modalities is not assigned.')
 
             # (bs, max_m, vocab)
-            pred_m, _ = self.forward(ids, src_mask=src_mask, word_emb=word_emb, first=first, max_m=max_m, max_t=max_t)
+            att_txt = torch.empty(batch_size, 0, dtype=torch.bool,
+                                  device=valid_length.device)  # empty mask for original MMM's CLS token
+            pred_m, _ = self.forward(ids, src_mask=src_mask, att_txt=att_txt, word_emb=word_emb, first=first, max_m=max_m, max_t=max_t)
 
             if rand_pos:
                 temperature = 1  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
