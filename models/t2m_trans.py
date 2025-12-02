@@ -170,7 +170,8 @@ class Text2Motion_Transformer(nn.Module):
 
     def __init__(self, 
                 vqvae,
-                num_vq=1024, 
+                num_vq=1024,
+                num_vt=0,
                 embed_dim=512, 
                 clip_dim=512, 
                 block_size=16, 
@@ -182,7 +183,7 @@ class Text2Motion_Transformer(nn.Module):
         super().__init__()
         self.n_head = n_head
         self.trans_base = CrossCondTransBase(vqvae, num_vq, embed_dim, clip_dim, block_size, num_layers, num_local_layer, n_head, drop_out_rate, fc_rate)
-        self.trans_head = CrossCondTransHead(num_vq, embed_dim, block_size, num_layers, n_head, drop_out_rate, fc_rate)
+        self.trans_head = CrossCondTransHead(num_vq, num_vt, embed_dim, block_size, num_layers, n_head, drop_out_rate, fc_rate)
         self.block_size = block_size
         self.num_vq = num_vq
 
@@ -197,6 +198,8 @@ class Text2Motion_Transformer(nn.Module):
             return self.forward_function(*args, **kwargs)
         elif type=='sample':
             return self.sample(*args, **kwargs)
+        elif type=='sample_new':
+            return self.sample_new(*args, **kwargs)
         elif type=='inpaint':
             return self.inpaint(*args, **kwargs)
         else:
@@ -210,11 +213,11 @@ class Text2Motion_Transformer(nn.Module):
         src_mask = src_mask.view(B, 1, 1, T).repeat(1, self.n_head, T, 1)
         return src_mask
 
-    def forward_function(self, idxs, clip_feature, src_mask=None, att_txt=None, word_emb=None):
+    def forward_function(self, idxs, clip_feature=None, src_mask=None, att_txt=None, word_emb=None, first=None, max_m=None, max_t=None):
         if src_mask is not None:
             src_mask = self.get_attn_mask(src_mask, att_txt)
-        feat = self.trans_base(idxs, clip_feature, src_mask, word_emb)
-        logits = self.trans_head(feat, src_mask)
+        feat = self.trans_base(idxs, clip_feature, src_mask, word_emb, first)
+        logits = self.trans_head(feat, src_mask, first, max_m, max_t)
 
         return logits
 
@@ -285,11 +288,7 @@ class Text2Motion_Transformer(nn.Module):
             pred_ids = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
             is_mask = ids == mask_id
 
-            ids = torch.where(
-                        is_mask,
-                        pred_ids,
-                        ids
-                    )
+            ids = torch.where(is_mask, pred_ids, ids)
             
             # if timestep == 1.:
             #     print(probs_without_temperature.shape)
@@ -300,7 +299,105 @@ class Text2Motion_Transformer(nn.Module):
         if if_test:
             return ids
         return ids
-    
+
+    def sample_new(self, special_ids=None, valid_length=None, max_m=50, max_t=77,
+                   rand_pos=True, token_cond=None, max_steps=10, first=None,
+                   word_emb=None, seq_mask_t=None):  ## TODO: motion to text: remove word_emb and seq_mask_t
+        max_length = max_m - 1  # 49
+        batch_size = valid_length.shape[0]
+        target_len = torch.ceil(valid_length / 4).long()  # target token length
+
+        if special_ids is None:  # text to motion
+            # set special ids
+            mask_id = self.num_vq + 2
+            pad_id = self.num_vq + 1
+            end_id = self.num_vq
+            # generate target token masks
+            shape = (batch_size, max_m)
+            seq_mask = generate_src_mask(max_m, target_len + 1)     # target token: motion
+            seq_mask_no_end = generate_src_mask(max_m, target_len)  # target token: motion
+
+        else:  # motion to text
+            # set special ids
+            mask_id = special_ids['mask_token_id']
+            pad_id = special_ids['pad_token_id']
+            end_id = special_ids['eos_token_id']
+            # generate target token masks
+            shape = (batch_size, max_t)
+            seq_mask = generate_src_mask(max_t, target_len + 1)     # target token: text
+            seq_mask_no_end = generate_src_mask(max_t, target_len)  # target token: text
+
+        ## TODO: motion to text: get BERT tokenizer and model to generate word_emb for each inference step
+        ##### Only for text to motion #####
+        scores = torch.ones(shape, dtype=torch.float32, device=valid_length.device)
+
+        if token_cond is not None:  # has partial condition
+            ids = token_cond.clone()
+            ids[~seq_mask_no_end] = pad_id
+            num_token_cond = (ids == mask_id).sum(-1)
+        else:  # start from full mask
+            ids = torch.full(shape, mask_id, dtype=torch.long, device=valid_length.device)
+
+        ## TODO: confirm that these 2 lines are not necessary (repeated below and maybe don't need them at all)
+        ids[~seq_mask] = pad_id                                 # replace with pad id
+        ids.scatter_(-1, target_len[..., None].long(), end_id)  # replace with end id
+
+        sample_max_steps = torch.round(max_steps / max_length * target_len) + 1e-8
+        for step in range(max_steps):
+            timestep = torch.clip(step / sample_max_steps, max=1)
+            if len(target_len) == 1 and step > 0 and torch.clip(step - 1 / sample_max_steps, max=1).cpu().item() == timestep:
+                break
+            rand_mask_prob = cosine_schedule(timestep)
+            num_token_masked = (rand_mask_prob * target_len).long().clip(min=1)
+
+            if token_cond is not None:
+                num_token_masked = (rand_mask_prob * num_token_cond).long().clip(min=1)
+                scores[token_cond != mask_id] = 0
+
+            # remove no motion frames
+            scores[~seq_mask_no_end] = 0
+            scores = scores / scores.sum(-1)[:, None]  # normalize only unmasked token
+
+            _, sorted_score_indices = scores.sort(descending=True)  # deterministic
+
+            ids[~seq_mask] = pad_id                                 # replace with pad id
+            ids.scatter_(-1, target_len[..., None].long(), end_id)  # replace with end id
+
+            # replace "mask_id" to "ids" that have highest "num_token_masked" "scores"
+            select_masked_indices = generate_src_mask(sorted_score_indices.shape[1], num_token_masked)
+            # repeat last_id to make it scatter_ the existing last ids
+            last_index = sorted_score_indices.gather(-1, num_token_masked.unsqueeze(-1) - 1)
+            sorted_score_indices = sorted_score_indices * select_masked_indices + (last_index * ~select_masked_indices)
+            ids.scatter_(-1, sorted_score_indices, mask_id)
+
+            if first == 'motion':
+                src_mask = torch.cat([seq_mask, seq_mask_t], dim=1)
+            elif first == 'text':
+                src_mask = torch.cat([seq_mask_t, seq_mask], dim=1)
+            else:
+                raise RuntimeError(f'The order of the two modalities is not assigned.')
+
+            # (bs, max_m, vocab)
+            pred_m, _ = self.forward(ids, src_mask=src_mask, word_emb=word_emb, first=first, max_m=max_m, max_t=max_t)
+
+            if rand_pos:
+                temperature = 1  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
+            else:
+                temperature = 0  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
+
+            # if temperature == 0, it is equal to argmax (pred_ids = pred_m.argmax(dim=-1))
+            pred_ids = gumbel_sample(pred_m, temperature=temperature, dim=-1)
+            is_mask = ids == mask_id
+
+            ids = torch.where(is_mask, pred_ids, ids)
+
+            # probs_without_temperature = pred_m.softmax(dim=-1)
+            # scores = 1 - probs_without_temperature.gather(-1, pred_ids[..., None])
+            # scores = rearrange(scores, '... 1 -> ...')
+            # scores = scores.masked_fill(~is_mask, 0)
+
+        return ids
+
     def inpaint(self, first_tokens, last_tokens, clip_feature=None, word_emb=None, inpaint_len=2, rand_pos=False):
         # support only one sample
         assert first_tokens.shape[0] == 1
@@ -533,8 +630,8 @@ class CrossCondTransBase(nn.Module):
         self.pos_embed = pos_encoding.PositionEmbedding(block_size, embed_dim, 0.0, False)
 
         self.num_local_layer = num_local_layer
+        self.word_emb = nn.Linear(clip_dim, embed_dim)
         if num_local_layer > 0:
-            self.word_emb = nn.Linear(clip_dim, embed_dim)
             self.cross_att = nn.Sequential(*[Block_crossatt(embed_dim, block_size, n_head, drop_out_rate, fc_rate) for _ in range(num_local_layer)])
         self.block_size = block_size
 
@@ -552,7 +649,7 @@ class CrossCondTransBase(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
     
-    def forward(self, idx, clip_feature, src_mask, word_emb):
+    def forward(self, idx, clip_feature, src_mask, word_emb, first=None):
         if len(idx) == 0:
             token_embeddings = self.cond_emb(clip_feature).unsqueeze(1)
         else:
@@ -565,15 +662,25 @@ class CrossCondTransBase(nn.Module):
             token_embeddings = torch.empty((*idx.shape, self.vqvae.vqvae.code_dim), device=idx.device)
             token_embeddings[not_learn_idx] = self.vqvae.vqvae.quantizer.dequantize(idx[not_learn_idx]).requires_grad_(False) 
             token_embeddings[learn_idx] = self.learn_tok_emb(idx[learn_idx]-self.vqvae.vqvae.num_code)
-            token_embeddings = self.to_emb(token_embeddings)
+            token_embeddings = self.to_emb(token_embeddings)  # (bs, max_m, embed_dim)
 
-            if self.num_local_layer > 0:
-                word_emb = self.word_emb(word_emb)
-                token_embeddings = self.pos_embed(token_embeddings)
-                for module in self.cross_att:
-                    token_embeddings = module(token_embeddings, word_emb)
-            token_embeddings = torch.cat([self.cond_emb(clip_feature).unsqueeze(1), token_embeddings], dim=1)
-            
+            if first == 'motion':
+                word_emb = self.word_emb(word_emb)                                         # (bs, max_t, embed_dim)
+                token_embeddings = torch.cat([token_embeddings, word_emb], dim=1)  # (bs, max_m + max_t, embed_dim)
+            elif first == 'text':
+                word_emb = self.word_emb(word_emb)                                         # (bs, max_t, embed_dim)
+                token_embeddings = torch.cat([word_emb, token_embeddings], dim=1)  # (bs, max_t + max_m, embed_dim)
+            else:
+                # Original MMM
+                if self.num_local_layer > 0:
+                    word_emb = self.word_emb(word_emb)                         # (bs, max_t, embed_dim)
+                    token_embeddings = self.pos_embed(token_embeddings)        # (bs, max_m, embed_dim)
+                    # text tokens - (cross attn) - motion tokens --> attn tokens
+                    for module in self.cross_att:
+                        token_embeddings = module(token_embeddings, word_emb)  # (bs, max_m, embed_dim)
+                # concat [text EOS token, attn tokens]
+                token_embeddings = torch.cat([self.cond_emb(clip_feature).unsqueeze(1), token_embeddings], dim=1)
+
         x = self.pos_embed(token_embeddings)
         for block in self.blocks:
             x = block(x, src_mask)
@@ -584,7 +691,8 @@ class CrossCondTransBase(nn.Module):
 class CrossCondTransHead(nn.Module):
 
     def __init__(self, 
-                num_vq=1024, 
+                num_vq=1024,
+                num_vt=0,
                 embed_dim=512, 
                 block_size=16, 
                 num_layers=2, 
@@ -596,6 +704,8 @@ class CrossCondTransHead(nn.Module):
         self.blocks = nn.Sequential(*[Block(embed_dim, block_size, n_head, drop_out_rate, fc_rate) for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_vq, bias=False)
+        if num_vt > 0:
+            self.head_t = nn.Linear(embed_dim, num_vt, bias=False)
         self.block_size = block_size
 
         self.apply(self._init_weights)
@@ -612,15 +722,18 @@ class CrossCondTransHead(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, x, src_mask):
+    def forward(self, x, src_mask, first=None, max_m=None, max_t=None):
         for block in self.blocks:
             x = block(x, src_mask)
         x = self.ln_f(x)
-        logits = self.head(x)
-        return logits
-
-    
-
-
-        
-
+        if first == 'motion':
+            logits_m = self.head(x[:, :max_m])    # (bs, max_m, vocab)
+            logits_t = self.head_t(x[:, max_m:])  # (bs, max_t, vocab)
+            return logits_m, logits_t
+        elif first == 'text':
+            logits_t = self.head_t(x[:, :max_t])  # (bs, max_t, vocab)
+            logits_m = self.head(x[:, max_t:])    # (bs, max_m, vocab)
+            return logits_m, logits_t
+        else:
+            logits = self.head(x)
+            return logits

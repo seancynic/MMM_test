@@ -10,6 +10,7 @@ from utils.motion_process import recover_from_ric
 from exit.utils import get_model, visualize_2motions, generate_src_mask
 from tqdm import tqdm
 
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def tensorborad_add_video_xyz(writer, xyz, nb_iter, tag, nb_vis=4, title_batch=None, outname=None):
     xyz = xyz[:1]
@@ -357,7 +358,153 @@ def evaluation_transformer(out_dir, val_loader, net, trans, logger, writer, nb_i
     trans.train()
     return pred_pose_eval, pose, m_length, clip_text, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, multimodality, writer, logger
 
-def evaluation_transformer_uplow(out_dir, val_loader, net, trans, logger, writer, nb_iter, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, clip_model, eval_wrapper, dataname, draw = True, save = True, savegif=False, num_repeat=1, rand_pos=False, CFG=-1) : 
+@torch.no_grad()
+def evaluation_transformer_new(out_dir, val_loader, net, trans, logger, writer, nb_iter,
+                               best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching,
+                               bert, max_m, max_t, eval_wrapper, first, draw=True, save=True, num_repeat=1, rand_pos=False):
+    if num_repeat < 0:  # evaluate all generations
+        is_avg_all = True
+        num_repeat = -num_repeat
+    else:  # evaluate last generation
+        is_avg_all = False
+
+    trans.eval()
+    nb_sample = 0
+    motion_annotation_list = []
+    motion_pred_list = []
+    motion_multimodality = []
+    R_precision_real = 0
+    R_precision = 0
+    matching_score_real = 0
+    matching_score_pred = 0
+
+    for batch in tqdm(val_loader):
+        ## TODO: motion to text: get BERT tokenizer and model to generate word_emb for each inference step
+        ##### only for text to motion #####
+        word_embeddings, pos_one_hots, sent_len, pose, m_length, input_ids, input_attn_mask = batch
+        bs, seq = pose.shape[:2]
+
+        device = next(bert.model.parameters()).device
+        word_emb = bert(input_ids=input_ids.to(device), attention_mask=input_attn_mask.to(device))
+
+        motion_multimodality_batch = []
+        m_tokens_len = torch.ceil(m_length / 4)
+
+        pred_len = m_length.cuda()
+        pred_tok_len = m_tokens_len
+
+        for i in range(num_repeat):
+            pred_pose_eval = torch.zeros((bs, seq, pose.shape[-1])).cuda()
+            index_motion = trans(type='sample_new', valid_length=pred_len, max_m=max_m, max_t=max_t,
+                                 rand_pos=rand_pos, first=first,
+                                 word_emb=word_emb, seq_mask_t=input_attn_mask)
+
+            # [INFO] need to run single sample at a time because it's conv
+            for k in range(bs):
+                ######### [INFO] Eval by m_length
+                # For evaluation: Decode the motion tokens into motion
+                pred_pose = net(index_motion[k:k + 1, :int(pred_tok_len[k].item())], type='decode')
+                pred_pose_eval[k:k + 1, :int(pred_len[k].item())] = pred_pose
+            et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
+            ######################################################
+
+            motion_multimodality_batch.append(em_pred.reshape(bs, 1, -1))
+
+            if i == 0 or is_avg_all:
+                pose = pose.cuda().float()
+
+                et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
+                motion_annotation_list.append(em)
+                motion_pred_list.append(em_pred)
+
+                temp_R, temp_match = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+                R_precision_real += temp_R
+                matching_score_real += temp_match
+                temp_R, temp_match = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+                R_precision += temp_R
+                matching_score_pred += temp_match
+
+                nb_sample += bs
+        motion_multimodality.append(torch.cat(motion_multimodality_batch, dim=1))
+
+    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+    mu, cov = calculate_activation_statistics(motion_pred_np)
+
+    diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
+    diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
+
+    R_precision_real = R_precision_real / nb_sample
+    R_precision = R_precision / nb_sample
+
+    matching_score_real = matching_score_real / nb_sample
+    matching_score_pred = matching_score_pred / nb_sample
+
+    multimodality = 0
+    motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
+    if num_repeat > 1:
+        multimodality = calculate_multimodality(motion_multimodality, 10)
+
+    fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+
+    msg = f"--> \t Eva. Iter {nb_iter} :, \n\
+                FID. {fid:.4f} , \n\
+                Diversity Real. {diversity_real:.4f}, \n\
+                Diversity. {diversity:.4f}, \n\
+                R_precision_real. {R_precision_real}, \n\
+                R_precision. {R_precision}, \n\
+                matching_score_real. {matching_score_real}, \n\
+                matching_score_pred. {matching_score_pred}, \n\
+                multimodality. {multimodality:.4f}"
+    logger.info(msg)
+
+    if draw:
+        writer.add_scalar('./Test/FID', fid, nb_iter)
+        writer.add_scalar('./Test/Diversity', diversity, nb_iter)
+        writer.add_scalar('./Test/top1', R_precision[0], nb_iter)
+        writer.add_scalar('./Test/top2', R_precision[1], nb_iter)
+        writer.add_scalar('./Test/top3', R_precision[2], nb_iter)
+        writer.add_scalar('./Test/matching_score', matching_score_pred, nb_iter)
+        writer.add_scalar('./Test/multimodality', multimodality, nb_iter)
+
+    if fid < best_fid:
+        msg = f"--> --> \t FID Improved from {best_fid:.5f} to {fid:.5f} !!!"
+        logger.info(msg)
+        best_fid, best_iter = fid, nb_iter
+
+    if matching_score_pred < best_matching:
+        msg = f"--> --> \t matching_score Improved from {best_matching:.5f} to {matching_score_pred:.5f} !!!"
+        logger.info(msg)
+        best_matching = matching_score_pred
+
+    if abs(diversity_real - diversity) < abs(diversity_real - best_div):
+        msg = f"--> --> \t Diversity Improved from {best_div:.5f} to {diversity:.5f} !!!"
+        logger.info(msg)
+        best_div = diversity
+
+    if R_precision[0] > best_top1:
+        msg = f"--> --> \t Top1 Improved from {best_top1:.4f} to {R_precision[0]:.4f} !!!"
+        logger.info(msg)
+        best_top1 = R_precision[0]
+
+    if R_precision[1] > best_top2:
+        msg = f"--> --> \t Top2 Improved from {best_top2:.4f} to {R_precision[1]:.4f} !!!"
+        logger.info(msg)
+        best_top2 = R_precision[1]
+
+    if R_precision[2] > best_top3:
+        msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
+        logger.info(msg)
+        best_top3 = R_precision[2]
+
+    if save:
+        torch.save({'trans': get_model(trans).state_dict()}, os.path.join(out_dir, 'net_last.pth'))
+
+    trans.train()
+    return best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, multimodality
+
+def evaluation_transformer_uplow(out_dir, val_loader, net, trans, logger, writer, nb_iter, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, clip_model, eval_wrapper, dataname, draw = True, save = True, savegif=False, num_repeat=1, rand_pos=False, CFG=-1) :
     from utils.humanml_utils import HML_UPPER_BODY_MASK, HML_LOWER_BODY_MASK
 
     trans.eval()

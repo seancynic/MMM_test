@@ -146,6 +146,7 @@ class Text2MotionDataset(data.Dataset):
         return len(self.data_dict) - self.pointer
 
     def __getitem__(self, item):
+        print('=== Start of getitem ===')
         idx = self.pointer + item
         name = self.name_list[idx]
         data = self.data_dict[name]
@@ -216,3 +217,38 @@ def cycle(iterable):
     while True:
         for x in iterable:
             yield x
+
+
+def collate_fn_with_bert(tokenizer, max_t):
+
+    def collate(batch):
+        batch.sort(key=lambda x: x[3], reverse=True)
+        collated = default_collate(batch)
+
+        word_embeddings, pos_one_hots, captions, sent_len, motion, m_length, _, _ = collated
+        with torch.no_grad():
+            inputs = tokenizer(captions, padding='max_length', truncation=True, max_length=max_t, return_tensors='pt')
+
+        return word_embeddings, pos_one_hots, sent_len, motion, m_length, inputs['input_ids'], inputs['attention_mask']
+
+    return collate
+
+
+def DATALoaderNew(dataset_name, is_test,
+               batch_size, w_vectorizer,
+               num_workers=8, unit_length=4, shuffle=True,
+               tokenizer=None, max_t=None):
+
+    if tokenizer is not None:
+        collate_function = collate_fn_with_bert(tokenizer, max_t)
+    else:
+        collate_function = collate_fn
+
+    val_loader = torch.utils.data.DataLoader(Text2MotionDataset(dataset_name, is_test, w_vectorizer, unit_length=unit_length, shuffle=shuffle),
+                                             batch_size,
+                                             shuffle=shuffle,
+                                             num_workers=num_workers,
+                                             collate_fn=collate_function,
+                                             drop_last=True)
+
+    return val_loader
