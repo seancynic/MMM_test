@@ -280,7 +280,7 @@ def train(first_modality, mask_probs, best_fid, best_iter, best_div, best_top1, 
 
         if nb_iter == 0 or nb_iter % args.eval_iter == 0 or nb_iter == args.total_iter:
             if nb_iter == args.total_iter:
-                num_repeat = -3
+                num_repeat = -30
                 rand_pos = True
                 val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, is_test=True, batch_size=32,
                                                            w_vectorizer=w_vectorizer, tokenizer=tokenizer, max_t=args.max_t)
