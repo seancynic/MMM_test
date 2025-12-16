@@ -25,7 +25,6 @@ from transformers import AutoTokenizer, ModernBertModel
 warnings.filterwarnings('ignore')
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-
 ##### ---- Exp dirs ---- #####
 args = option_trans.get_args_parser()
 torch.manual_seed(args.seed)
@@ -35,11 +34,10 @@ init_save_folder(args)
 args.vq_dir = f'./output/vq/{args.vq_name}'
 codebook_dir = f'{args.vq_dir}/codebook/'
 args.resume_pth = f'{args.vq_dir}/net_last.pth'
-os.makedirs(args.vq_dir, exist_ok = True)
-os.makedirs(codebook_dir, exist_ok = True)
-os.makedirs(args.out_dir, exist_ok = True)
-os.makedirs(args.out_dir+'/html', exist_ok=True)
-
+os.makedirs(args.vq_dir, exist_ok=True)
+os.makedirs(codebook_dir, exist_ok=True)
+os.makedirs(args.out_dir, exist_ok=True)
+os.makedirs(args.out_dir + '/html', exist_ok=True)
 
 ##### ---- Logger ---- #####
 logger = utils_model.get_logger(args.out_dir)
@@ -47,13 +45,13 @@ writer = SummaryWriter(args.out_dir)
 logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
 from utils.word_vectorizer import WordVectorizer
+
 w_vectorizer = WordVectorizer('./glove', 'our_vab')
 
 dataset_opt_path = 'checkpoints/kit/Comp_v6_KLD005/opt.txt' if args.dataname == 'kit' else 'checkpoints/t2m/Comp_v6_KLD005/opt.txt'
 
 wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
 eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
-
 
 ##### ---- Network ---- #####
 device = torch.device('cuda')
@@ -63,6 +61,7 @@ modernbert = ModernBertModel.from_pretrained(model_name, attn_implementation='ea
 modernbert.eval()
 for p in modernbert.parameters():
     p.requires_grad = False
+
 
 class TextModernBERT(torch.nn.Module):
     def __init__(self, model):
@@ -76,6 +75,7 @@ class TextModernBERT(torch.nn.Module):
                                  output_hidden_states=False,
                                  return_dict=True)
         return outputs.last_hidden_state.float()  # (bs, max_t, dim)
+
 
 bert = TextModernBERT(modernbert)
 print(f'ModernBERT vocab_size: {bert.model.config.vocab_size}')
@@ -121,21 +121,18 @@ trans_encoder.train()
 trans_encoder.cuda()
 trans_encoder = torch.nn.DataParallel(trans_encoder)
 
-
 ##### ---- Optimizer & Scheduler ---- #####
 optimizer = utils_model.initial_optim(args.decay_option, args.lr, args.weight_decay, trans_encoder, args.optimizer)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_scheduler, gamma=args.gamma)
 
-
 ##### ---- Optimization goals ---- #####
 loss_ce = torch.nn.CrossEntropyLoss(reduction='none')
-
 
 ##### ---- get code ---- #####
 ##### ---- Dataloader ---- #####
 # Encode all motions into motion tokens for training
 if len(os.listdir(codebook_dir)) == 0:
-    train_loader_token = dataset_tokenize.DATALoader(args.dataname, 1, unit_length=2**args.down_t)
+    train_loader_token = dataset_tokenize.DATALoader(args.dataname, 1, unit_length=2 ** args.down_t)
     for batch in train_loader_token:
         pose, name = batch
         bs, seq = pose.shape[0], pose.shape[1]
@@ -143,12 +140,12 @@ if len(os.listdir(codebook_dir)) == 0:
         pose = pose.cuda().float()  # bs, nb_joints, joints_dim, seq_len
         target = net(pose, type='encode')
         target = target.cpu().numpy()
-        np.save(pjoin(codebook_dir, name[0] +'.npy'), target)
+        np.save(pjoin(codebook_dir, name[0] + '.npy'), target)
 
-train_loader = dataset_TM_train.DATALoader(args.dataname, args.batch_size, args.nb_code, codebook_dir, unit_length=2**args.down_t)
+train_loader = dataset_TM_train.DATALoader(args.dataname, args.batch_size, args.nb_code, codebook_dir,
+                                           unit_length=2 ** args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
 
-        
 ##### ---- Training ---- #####
 best_fid = 1000
 best_iter = 0
@@ -161,6 +158,7 @@ best_matching = 100
 max_t = 77
 first_modality = 'motion'  # "motion" or "text"
 
+
 def get_acc(cls_pred, target, mask):
     cls_pred = torch.masked_select(cls_pred, mask.unsqueeze(-1)).view(-1, cls_pred.shape[-1])
     target_all = torch.masked_select(target, mask)
@@ -169,7 +167,8 @@ def get_acc(cls_pred, target, mask):
     right_num = (cls_pred_index == target_all).sum()
     return right_num * 100 / mask.sum()
 
-def masking(ids, m_tokens_len, batch_size, max_len, mask_id):
+
+def masking(ids, m_tokens_len, batch_size, max_len, mask_id, min_mask_prob=0.5, max_mask_prob=1):
     if args.pkeep == -1:
         proba = np.random.rand(1)[0]
         mask = torch.bernoulli(proba * torch.ones(ids.shape, device=ids.device))
@@ -188,7 +187,7 @@ def masking(ids, m_tokens_len, batch_size, max_len, mask_id):
     input_indices = mask * ids + (1 - mask) * r_indices
 
     # Step 2: Time-step masking
-    rand_mask_probs = torch.zeros(batch_size, device=m_tokens_len.device).float().uniform_(0.5, 1)
+    rand_mask_probs = torch.zeros(batch_size, device=m_tokens_len.device).float().uniform_(min_mask_prob, max_mask_prob)
     num_token_masked = (m_tokens_len * rand_mask_probs).round().clamp(min=1)
     batch_randperm = torch.rand((batch_size, max_len), device=ids.device) - seq_mask_no_end.int()
     batch_randperm = batch_randperm.argsort(dim=-1)
@@ -199,21 +198,25 @@ def masking(ids, m_tokens_len, batch_size, max_len, mask_id):
 
     return masked_input_indices, seq_mask, seq_mask_no_end, mask_token
 
+
 def construct_pred_and_label(pred, ids, seq_mask_no_end):
-    weights = seq_mask_no_end / (seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])  # weights[i, j] = 1 / (num_valid * B)
+    weights = seq_mask_no_end / (
+                seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])  # weights[i, j] = 1 / (num_valid * B)
     pred_seq_masked = pred[seq_mask_no_end, :].view(-1, pred.shape[-1])  # (num_valid, vocab)
-    target_seq_masked = ids[seq_mask_no_end]                             # (num_valid,)
-    weight_seq_masked = weights[seq_mask_no_end]                         # (num_valid,)
+    target_seq_masked = ids[seq_mask_no_end]  # (num_valid,)
+    weight_seq_masked = weights[seq_mask_no_end]  # (num_valid,)
 
     return pred_seq_masked, target_seq_masked, weight_seq_masked
 
+
 def compute_result(pred_seq_masked, target, seq_mask_no_end):
-    probs_seq_masked = torch.softmax(pred_seq_masked, dim=-1)         # (num_valid, vocab)
-    _, pred_seq_masked_index = torch.max(probs_seq_masked, dim=-1)    # (num_valid,)
+    probs_seq_masked = torch.softmax(pred_seq_masked, dim=-1)  # (num_valid, vocab)
+    _, pred_seq_masked_index = torch.max(probs_seq_masked, dim=-1)  # (num_valid,)
     target_seq_masked = torch.masked_select(target, seq_mask_no_end)  # (num_valid,)
     right_seq_masked = (pred_seq_masked_index == target_seq_masked).sum()  # compare with label
 
     return right_seq_masked
+
 
 # while nb_iter <= args.total_iter:
 for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
@@ -227,10 +230,10 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
 
     mask_id = get_model(net).vqvae.num_code + 2
     mask_id_t = tokenizer.mask_token_id  # [MASK] token id in ModernBERT
-    
+
     # Encode all texts into text tokens for training
     inputs = tokenizer(clip_text, padding='max_length', truncation=True, max_length=max_t, return_tensors='pt')
-    input_ids = inputs['input_ids'].to(device)             # (bs, max_t)
+    input_ids = inputs['input_ids'].to(device)  # (bs, max_t)
     input_attn_mask = inputs['attention_mask'].to(device)  # (bs, max_t)
 
     # Get t_tokens_len
@@ -240,7 +243,9 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
 
     # Masking
     masked_input_ids, seq_mask, seq_mask_no_end, mask_token = masking(target, m_tokens_len, batch_size, max_m, mask_id)
-    masked_input_ids_t, seq_mask_t, seq_mask_no_end_t, mask_token_t = masking(input_ids, t_tokens_len, batch_size, max_t, mask_id_t)
+    masked_input_ids_t, seq_mask_t, seq_mask_no_end_t, mask_token_t = masking(input_ids, t_tokens_len, batch_size,
+                                                                              max_t, mask_id_t, min_mask_prob=0,
+                                                                              max_mask_prob=1)
     assert torch.equal(seq_mask_t, input_attn_mask), f'seq_mask_t cannot match the attention mask of text.'
 
     if first_modality == 'motion':
@@ -255,11 +260,13 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
     # Training forward
     # output: (bs, max_m, vocab), (bs, max_t, vocab)
     pred_m, pred_t = trans_encoder(
-        masked_input_ids, src_mask=src_mask, att_txt=att_txt, word_emb=word_emb, first=first_modality, max_m=max_m, max_t=max_t)
+        masked_input_ids, src_mask=src_mask, att_txt=att_txt, word_emb=word_emb, first=first_modality, max_m=max_m,
+        max_t=max_t)
 
     # Compute xent loss as a batch
     pred_seq_masked, target_seq_masked, weight_seq_masked = construct_pred_and_label(pred_m, target, seq_mask_no_end)
-    pred_seq_masked_t, target_seq_masked_t, weight_seq_masked_t = construct_pred_and_label(pred_t, input_ids, seq_mask_no_end_t)
+    pred_seq_masked_t, target_seq_masked_t, weight_seq_masked_t = construct_pred_and_label(pred_t, input_ids,
+                                                                                           seq_mask_no_end_t)
 
     loss_m = F.cross_entropy(pred_seq_masked, target_seq_masked, reduction='none')
     loss_m = (loss_m * weight_seq_masked).sum()
@@ -282,7 +289,7 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
         writer.add_scalar('./Loss/all', loss, nb_iter)
         writer.add_scalar('./ACC/every_motion', right_seq_masked * 100 / seq_mask_no_end.sum(), nb_iter)
         writer.add_scalar('./ACC/every_text', right_seq_masked_t * 100 / seq_mask_no_end_t.sum(), nb_iter)
-        
+
         # [INFO] log mask/nomask separately
         no_mask_token = ~mask_token * seq_mask_no_end
         no_mask_token_t = ~mask_token_t * seq_mask_no_end_t
