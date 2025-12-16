@@ -7,8 +7,12 @@ from scipy import linalg
 
 # import visualization.plot_3d_global as plot_3d
 from utils.motion_process import recover_from_ric
-from exit.utils import get_model, visualize_2motions, generate_src_mask
+from exit.utils import get_model, generate_src_mask
 from tqdm import tqdm
+
+from nltk.translate.bleu_score import sentence_bleu
+from rouge_score import rouge_scorer
+
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -361,8 +365,9 @@ def evaluation_transformer(out_dir, val_loader, net, trans, logger, writer, nb_i
 
 @torch.no_grad()
 def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
-                 best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching,
-                 bert, max_m, max_t, eval_wrapper, first, draw=True, save=True, num_repeat=1, rand_pos=False):
+                 eval_wrapper, max_m, max_t, first,
+                 best_iter=0, best_fid=1000, best_div=100, best_top1=0, best_top2=0, best_top3=0, best_matching=100,
+                 draw=True, save=True, num_repeat=1, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
         is_avg_all = True
         num_repeat = -num_repeat
@@ -379,35 +384,28 @@ def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
     matching_score_real = 0
     matching_score_pred = 0
 
-    for batch in tqdm(val_loader):
-        ## TODO: motion to text: get BERT tokenizer and model to generate word_emb for each inference step
-        ##### only for text to motion #####
-        word_embeddings, pos_one_hots, sent_len, pose, m_length, input_ids, input_attn_mask = batch
+    for batch in tqdm(val_loader, position=1, leave=True):
+        word_embeddings, pos_one_hots, sent_len, _, pose, m_length, input_ids, input_attn_mask, _ = batch
         bs, seq = pose.shape[:2]
+        lens_m = torch.ceil(m_length / 4).long()
+        pred_len = m_length.cuda()
 
-        device = next(bert.model.parameters()).device
-        word_emb = bert(input_ids=input_ids.to(device), attention_mask=input_attn_mask.to(device))
+        word_emb = trans.module.bert(input_ids=input_ids.cuda(), attention_mask=input_attn_mask.cuda())
 
         motion_multimodality_batch = []
-        m_tokens_len = torch.ceil(m_length / 4)
-
-        pred_len = m_length.cuda()
-        pred_tok_len = m_tokens_len
 
         for i in range(num_repeat):
-            pred_pose_eval = torch.zeros((bs, seq, pose.shape[-1])).cuda()
-            index_motion = trans(type='sample_new', valid_length=pred_len, max_m=max_m, max_t=max_t,
-                                 rand_pos=rand_pos, first=first,
-                                 word_emb=word_emb, seq_mask_t=input_attn_mask)
+            index_motion = trans(type='sample_m', lens_m=lens_m.cuda(), word_emb=word_emb, seq_mask_t=input_attn_mask,
+                                 max_m=max_m, max_t=max_t, rand_pos=rand_pos, first=first)  # (bs, max_m)
 
             # [INFO] need to run single sample at a time because it's conv
+            pred_pose_eval = torch.zeros(pose.shape).cuda()
             for k in range(bs):
-                ######### [INFO] Eval by m_length
-                # For evaluation: Decode the motion tokens into motion
-                pred_pose = net(index_motion[k:k + 1, :int(pred_tok_len[k].item())], type='decode')
-                pred_pose_eval[k:k + 1, :int(pred_len[k].item())] = pred_pose
+                # [INFO] Eval by m_length
+                pred_pose = net(index_motion[k:k + 1, :lens_m[k].item()], type='decode')  # (1, m_length, dim_m)
+                pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose                  # (bs, m_length, dim_m)
+
             et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
-            ######################################################
 
             motion_multimodality_batch.append(em_pred.reshape(bs, 1, -1))
 
@@ -421,11 +419,13 @@ def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
                 temp_R, temp_match = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
                 R_precision_real += temp_R
                 matching_score_real += temp_match
+
                 temp_R, temp_match = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
                 R_precision += temp_R
                 matching_score_pred += temp_match
 
                 nb_sample += bs
+
         motion_multimodality.append(torch.cat(motion_multimodality_batch, dim=1))
 
     motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
@@ -443,9 +443,9 @@ def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
     matching_score_pred = matching_score_pred / nb_sample
 
     multimodality = 0
-    # motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
-    # if num_repeat > 1:
-    #     multimodality = calculate_multimodality(motion_multimodality, 10)
+    motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
+    if num_repeat > 1:
+        multimodality = calculate_multimodality(motion_multimodality, 10)
 
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
 
@@ -503,7 +503,175 @@ def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
         torch.save({'trans': get_model(trans).state_dict()}, os.path.join(out_dir, 'net_last.pth'))
 
     trans.train()
-    return best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, multimodality
+    return best_iter, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, multimodality
+
+@torch.no_grad()
+def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
+                 eval_wrapper, tokenizer, special_ids, invalid_ids, max_m, max_t, first,
+                 best_iter=0., best_bleu1=0., best_bleu2=0., best_bleu3=0., best_bleu4=0., best_rouge_l=0.,
+                 draw=True, save=True, num_repeat=1, rand_pos=False):
+    if num_repeat < 0:  # evaluate all generations
+        is_avg_all = True
+        num_repeat = -num_repeat
+    else:  # evaluate last generation
+        is_avg_all = False
+
+    trans.eval()
+    nb_sample = 0
+    # motion_multimodality = []
+    # R_precision_real = 0
+    # R_precision = 0
+    # matching_score_real = 0
+    # matching_score_pred = 0
+    bleu1, bleu2, bleu3, bleu4, rouge_l = 0., 0., 0., 0., 0.
+
+    for batch in tqdm(val_loader, position=2, leave=True):
+        word_embeddings, pos_one_hots, sent_len, token_ids_m, pose, m_length, input_ids, input_attn_mask, captions = batch
+        bs, seq = pose.shape[:2]
+        lens_m = torch.ceil(m_length / 4).long()
+
+        # Get lengths for each text in batch
+        t_valid_mask = ~torch.isin(input_ids.cuda(), torch.tensor(invalid_ids).cuda())
+        lens_t = t_valid_mask.sum(dim=1)
+
+        # Get motion mask
+        seq_mask_m = generate_src_mask(max_m, lens_m + 1)
+
+        for i in range(num_repeat):
+            index_text = trans(type='sample_t', special_ids=special_ids, lens_t=lens_t, token_ids_m=token_ids_m, seq_mask_m=seq_mask_m,
+                               max_m=max_m, max_t=max_t, rand_pos=rand_pos, first=first)  # (bs, max_m)
+
+            pred_text = decode_token_ids(index_text, tokenizer, pad_token_id=special_ids['pad_id'], eos_token_id=special_ids['eos_id'])
+
+            # # [INFO] need to run single sample at a time because it's conv
+            # pred_pose_eval = torch.zeros(pose.shape).cuda()
+            # for k in range(bs):
+            #     # [INFO] Eval by m_length
+            #     pred_pose = net(index_motion[k:k + 1, :lens_m[k].item()], type='decode')  # (1, m_length, dim_m)
+            #     pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose  # (bs, m_length, dim_m)
+            #
+            # et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
+            #
+            # motion_multimodality_batch.append(em_pred.reshape(bs, 1, -1))
+
+            if i == 0 or is_avg_all:
+                # pose = pose.cuda().float()
+                #
+                # et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
+                #
+                # temp_R, temp_match = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+                # R_precision_real += temp_R
+                # matching_score_real += temp_match
+                #
+                # temp_R, temp_match = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+                # R_precision += temp_R
+                # matching_score_pred += temp_match
+
+                rouge_l += compute_rouge_l(pred_text, captions)
+                bleu_scores = compute_bleu_scores(pred_text, captions)
+                bleu1 += bleu_scores['BLEU-1']
+                bleu2 += bleu_scores['BLEU-2']
+                bleu3 += bleu_scores['BLEU-3']
+                bleu4 += bleu_scores['BLEU-4']
+
+                nb_sample += bs
+
+    #     motion_multimodality.append(torch.cat(motion_multimodality_batch, dim=1))
+    #
+    # R_precision_real = R_precision_real / nb_sample
+    # R_precision = R_precision / nb_sample
+    #
+    # matching_score_real = matching_score_real / nb_sample
+    # matching_score_pred = matching_score_pred / nb_sample
+    #
+    # multimodality = 0
+    # motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
+    # if num_repeat > 1:
+    #     multimodality = calculate_multimodality(motion_multimodality, 10)
+
+    bleu1 = bleu1 / nb_sample
+    bleu2 = bleu2 / nb_sample
+    bleu3 = bleu3 / nb_sample
+    bleu4 = bleu4 / nb_sample
+    rouge_l = rouge_l / nb_sample
+
+    # msg = f"--> \t Eva. Iter {nb_iter} :, \n\
+    #             R_precision_real. {R_precision_real}, \n\
+    #             R_precision. {R_precision}, \n\
+    #             matching_score_real. {matching_score_real}, \n\
+    #             matching_score_pred. {matching_score_pred}, \n\
+    #             multimodality. {multimodality:.4f}"
+    msg = f"--> \t Eva. Iter {nb_iter} :, \n\
+                bleu1. {bleu1}, \n\
+                bleu2. {bleu2}, \n\
+                bleu3. {bleu3}, \n\
+                bleu4. {bleu4}, \n\
+                rouge_l. {rouge_l:.4f}"
+    logger.info(msg)
+
+    if draw:
+        # writer.add_scalar('./Test/top1', R_precision[0], nb_iter)
+        # writer.add_scalar('./Test/top2', R_precision[1], nb_iter)
+        # writer.add_scalar('./Test/top3', R_precision[2], nb_iter)
+        # writer.add_scalar('./Test/matching_score', matching_score_pred, nb_iter)
+        # writer.add_scalar('./Test/multimodality', multimodality, nb_iter)
+        writer.add_scalar('./Test/bleu1', bleu1, nb_iter)
+        writer.add_scalar('./Test/bleu2', bleu2, nb_iter)
+        writer.add_scalar('./Test/bleu3', bleu3, nb_iter)
+        writer.add_scalar('./Test/bleu4', bleu4, nb_iter)
+        writer.add_scalar('./Test/rouge_l', rouge_l, nb_iter)
+
+    # if matching_score_pred < best_matching:
+    #     msg = f"--> --> \t matching_score Improved from {best_matching:.5f} to {matching_score_pred:.5f} !!!"
+    #     logger.info(msg)
+    #     best_matching = matching_score_pred
+
+    # if R_precision[0] > best_top1:
+    #     msg = f"--> --> \t Top1 Improved from {best_top1:.4f} to {R_precision[0]:.4f} !!!"
+    #     logger.info(msg)
+    #     best_top1 = R_precision[0]
+
+    # if R_precision[1] > best_top2:
+    #     msg = f"--> --> \t Top2 Improved from {best_top2:.4f} to {R_precision[1]:.4f} !!!"
+    #     logger.info(msg)
+    #     best_top2 = R_precision[1]
+
+    # if R_precision[2] > best_top3:
+    #     msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
+    #     logger.info(msg)
+    #     best_top3 = R_precision[2]
+
+    if bleu1 > best_bleu1:
+        msg = f"--> --> \t BLEU1 Improved from {best_bleu1:.4f} to {bleu1:.4f} !!!"
+        logger.info(msg)
+        best_bleu1 = bleu1
+
+    if bleu2 > best_bleu2:
+        msg = f"--> --> \t BLEU2 Improved from {best_bleu2:.4f} to {bleu2:.4f} !!!"
+        logger.info(msg)
+        best_bleu2 = bleu2
+
+    if bleu3 > best_bleu3:
+        msg = f"--> --> \t BLEU3 Improved from {best_bleu3:.4f} to {bleu3:.4f} !!!"
+        logger.info(msg)
+        best_bleu3 = bleu3
+
+    if bleu4 > best_bleu4:
+        msg = f"--> --> \t BLEU4 Improved from {best_bleu4:.4f} to {bleu4:.4f} !!!"
+        logger.info(msg)
+        best_bleu4, best_iter = bleu4, nb_iter
+
+    if rouge_l > best_rouge_l:
+        msg = f"--> --> \t ROUGE_L Improved from {best_rouge_l:.3f} to {rouge_l:.3f} !!!"
+        logger.info(msg)
+        best_rouge_l = rouge_l
+
+    if save:
+        torch.save({'trans': get_model(trans).state_dict()}, os.path.join(out_dir, 'net_last_t.pth'))
+
+    trans.train()
+    # return best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, multimodality
+    return best_iter, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l
 
 def evaluation_transformer_uplow(out_dir, val_loader, net, trans, logger, writer, nb_iter, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, clip_model, eval_wrapper, dataname, draw = True, save = True, savegif=False, num_repeat=1, rand_pos=False, CFG=-1) :
     from utils.humanml_utils import HML_UPPER_BODY_MASK, HML_LOWER_BODY_MASK
@@ -961,3 +1129,60 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
         sigma2=np.cov(feature_list2, rowvar=False),
     )
     return dist
+
+def decode_token_ids(token_ids, tokenizer, pad_token_id, eos_token_id):
+    decoded_texts = []
+
+    for ids in token_ids:
+        ids = ids.tolist()
+
+        clean_ids = []
+        for t in ids:
+            if t == eos_token_id:
+                break
+            if t == pad_token_id:
+                continue
+            clean_ids.append(t)
+
+        text = tokenizer.decode(clean_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        decoded_texts.append(text.strip())
+
+    return decoded_texts
+
+def compute_bleu_scores(preds, refs):
+    bleu1 = bleu2 = bleu3 = bleu4 = 0.0
+
+    for pred, ref in zip(preds, refs):
+        pred_tokens = pred.split()
+        ref_tokens = ref.split()
+        bleu1 += sentence_bleu([ref_tokens], pred_tokens, weights=(1, 0, 0, 0))
+        bleu2 += sentence_bleu([ref_tokens], pred_tokens, weights=(0.5, 0.5, 0, 0))
+        bleu3 += sentence_bleu([ref_tokens], pred_tokens, weights=(1/3, 1/3, 1/3, 0))
+        bleu4 += sentence_bleu([ref_tokens], pred_tokens, weights=(0.25, 0.25, 0.25, 0.25))
+
+    return {
+        "BLEU-1": bleu1 / len(preds),
+        "BLEU-2": bleu2 / len(preds),
+        "BLEU-3": bleu3 / len(preds),
+        "BLEU-4": bleu4 / len(preds),
+    }
+
+def compute_rouge_l(preds, refs):
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    rouge_l_f = 0.0
+
+    for pred, ref in zip(preds, refs):
+        score = scorer.score(ref, pred)
+        rouge_l_f += score['rougeL'].fmeasure
+
+    return rouge_l_f / len(preds)
+
+def evaluate_text_generation(index_text, gt_text, tokenizer, pad_token_id, eos_token_id):
+    pred_text = decode_token_ids(index_text, tokenizer, pad_token_id, eos_token_id)
+    bleu_scores = compute_bleu_scores(pred_text, gt_text)
+    rouge_l = compute_rouge_l(pred_text, gt_text)
+
+    return {
+        **bleu_scores,
+        'ROUGE-L': rouge_l
+    }

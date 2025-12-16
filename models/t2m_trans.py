@@ -2,12 +2,12 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributions import Categorical
 import models.pos_encoding as pos_encoding
 from exit.utils import cosine_schedule, uniform, top_k, gumbel_sample, top_p
-from tqdm import tqdm
-from einops import rearrange, repeat
+from einops import rearrange
 from exit.utils import get_model, generate_src_mask
+from transformers import ModernBertModel
+
 
 class PatchUpSampling(nn.Module):
     def __init__(self, dim, norm_layer=nn.LayerNorm):
@@ -166,12 +166,28 @@ class Encoder_Transformer(nn.Module):
         x = self.head(x).permute(0, 2, 1)
         return x
 
+class TextModernBERT(torch.nn.Module):
+    def __init__(self, model):
+        super(TextModernBERT, self).__init__()
+        self.model = model
+        self.vocab_size = model.config.vocab_size
+        self.cls_id = model.config.cls_token_id
+        self.eos_id = model.config.eos_token_id
+        self.pad_id = model.config.pad_token_id
+
+    def forward(self, input_ids, attention_mask):
+        with torch.no_grad():
+            outputs = self.model(input_ids=input_ids,
+                                 attention_mask=attention_mask,
+                                 output_hidden_states=False,
+                                 return_dict=True)
+        return outputs.last_hidden_state.float()  # (bs, max_t, dim)
+
 class Text2Motion_Transformer(nn.Module):
 
     def __init__(self, 
                 vqvae,
                 num_vq=1024,
-                num_vt=0,
                 embed_dim=512, 
                 clip_dim=512, 
                 block_size=16, 
@@ -181,12 +197,19 @@ class Text2Motion_Transformer(nn.Module):
                 drop_out_rate=0.1, 
                 fc_rate=4):
         super().__init__()
+        # ModernBERT
+        model_name = 'answerdotai/modernbert-base'
+        modernbert = ModernBertModel.from_pretrained(model_name).half()  # float16
+        modernbert.eval()
+        for p in modernbert.parameters():
+            p.requires_grad = False
+        self.bert = TextModernBERT(modernbert)
+
         self.n_head = n_head
-        self.trans_base = CrossCondTransBase(vqvae, num_vq, embed_dim, clip_dim, block_size, num_layers, num_local_layer, n_head, drop_out_rate, fc_rate)
-        self.trans_head = CrossCondTransHead(num_vq, num_vt, embed_dim, block_size, num_layers, n_head, drop_out_rate, fc_rate)
+        self.trans_base = CrossCondTransBase(vqvae, num_vq, embed_dim, modernbert.config.hidden_size, block_size, num_layers, num_local_layer, n_head, drop_out_rate, fc_rate)
+        self.trans_head = CrossCondTransHead(num_vq, modernbert.config.vocab_size, embed_dim, block_size, num_layers, n_head, drop_out_rate, fc_rate)
         self.block_size = block_size
         self.num_vq = num_vq
-
         # self.skip_trans = Skip_Connection_Transformer(num_vq, embed_dim, clip_dim, block_size, num_layers, n_head, drop_out_rate, fc_rate)
 
     def get_block_size(self):
@@ -198,8 +221,10 @@ class Text2Motion_Transformer(nn.Module):
             return self.forward_function(*args, **kwargs)
         elif type=='sample':
             return self.sample(*args, **kwargs)
-        elif type=='sample_new':
-            return self.sample_new(*args, **kwargs)
+        elif type=='sample_m':
+            return self.sample_m(*args, **kwargs)
+        elif type=='sample_t':
+            return self.sample_t(*args, **kwargs)
         elif type=='inpaint':
             return self.inpaint(*args, **kwargs)
         else:
@@ -301,87 +326,78 @@ class Text2Motion_Transformer(nn.Module):
             return ids
         return ids
 
-    def sample_new(self, special_ids=None, valid_length=None, max_m=50, max_t=77,
-                   rand_pos=True, token_cond=None, max_steps=10, first=None,
-                   word_emb=None, seq_mask_t=None):  ## TODO: motion to text: remove word_emb and seq_mask_t
+    def sample_m(self, lens_m=None, word_emb=None, seq_mask_t=None,
+                 max_m=50, max_t=77, rand_pos=True, token_cond=None, max_steps=10, first=None):
         max_length = max_m - 1  # 49
-        batch_size = valid_length.shape[0]
-        target_len = torch.ceil(valid_length / 4).long()  # target token length
+        batch_size = lens_m.shape[0]
 
-        if special_ids is None:  # text to motion
-            # set special ids
-            mask_id = self.num_vq + 2
-            pad_id = self.num_vq + 1
-            end_id = self.num_vq
-            # generate target token masks
-            shape = (batch_size, max_m)
-            seq_mask = generate_src_mask(max_m, target_len + 1)     # target token: motion
-            seq_mask_no_end = generate_src_mask(max_m, target_len)  # target token: motion
+        # set special ids
+        mask_id = self.num_vq + 2
+        pad_id = self.num_vq + 1
+        end_id = self.num_vq
 
-        else:  # motion to text
-            # set special ids
-            mask_id = special_ids['mask_token_id']
-            pad_id = special_ids['pad_token_id']
-            end_id = special_ids['eos_token_id']
-            # generate target token masks
-            shape = (batch_size, max_t)
-            seq_mask = generate_src_mask(max_t, target_len + 1)     # target token: text
-            seq_mask_no_end = generate_src_mask(max_t, target_len)  # target token: text
+        # generate target token masks
+        shape = (batch_size, max_m)
+        seq_mask_m = generate_src_mask(max_m, lens_m + 1)  # target token: motion
+        seq_mask_no_end_m = generate_src_mask(max_m, lens_m)  # target token: motion
 
-        ## TODO: motion to text: get BERT tokenizer and model to generate word_emb for each inference step
-        ##### Only for text to motion #####
-        scores = torch.ones(shape, dtype=torch.float32, device=valid_length.device)
+        # init sampling score
+        scores = torch.ones(shape, dtype=torch.float32, device=lens_m.device)
 
+        # init motion token ids
         if token_cond is not None:  # has partial condition
-            ids = token_cond.clone()
-            ids[~seq_mask_no_end] = pad_id
-            num_token_cond = (ids == mask_id).sum(-1)
+            token_ids_m = token_cond.clone()
+            token_ids_m[~seq_mask_no_end_m] = pad_id
+            num_token_cond = (token_ids_m == mask_id).sum(-1)
         else:  # start from full mask
-            ids = torch.full(shape, mask_id, dtype=torch.long, device=valid_length.device)
+            token_ids_m = torch.full(shape, mask_id, dtype=torch.long, device=lens_m.device)
 
         ## TODO: confirm that these 2 lines are not necessary (repeated below and maybe don't need them at all)
-        ids[~seq_mask] = pad_id                                 # replace with pad id
-        ids.scatter_(-1, target_len[..., None].long(), end_id)  # replace with end id
+        token_ids_m[~seq_mask_m] = pad_id                           # replace with pad id
+        token_ids_m.scatter_(-1, lens_m[..., None].long(), end_id)  # replace with end id
 
-        sample_max_steps = torch.round(max_steps / max_length * target_len) + 1e-8
+        sample_max_steps = torch.round(max_steps / max_length * lens_m) + 1e-8
         for step in range(max_steps):
             timestep = torch.clip(step / sample_max_steps, max=1)
-            if len(target_len) == 1 and step > 0 and torch.clip(step - 1 / sample_max_steps, max=1).cpu().item() == timestep:
+            if len(lens_m) == 1 and step > 0 and torch.clip(step - 1 / sample_max_steps, max=1).cpu().item() == timestep:
                 break
             rand_mask_prob = cosine_schedule(timestep)
-            num_token_masked = (rand_mask_prob * target_len).long().clip(min=1)
+            num_token_masked = (rand_mask_prob * lens_m).long().clip(min=1)
 
             if token_cond is not None:
                 num_token_masked = (rand_mask_prob * num_token_cond).long().clip(min=1)
                 scores[token_cond != mask_id] = 0
 
             # remove no motion frames
-            scores[~seq_mask_no_end] = 0
+            scores[~seq_mask_no_end_m] = 0
             scores = scores / scores.sum(-1)[:, None]  # normalize only unmasked token
 
             _, sorted_score_indices = scores.sort(descending=True)  # deterministic
 
-            ids[~seq_mask] = pad_id                                 # replace with pad id
-            ids.scatter_(-1, target_len[..., None].long(), end_id)  # replace with end id
+            token_ids_m[~seq_mask_m] = pad_id                           # replace with pad id
+            token_ids_m.scatter_(-1, lens_m[..., None].long(), end_id)  # replace with end id
 
             # replace "mask_id" to "ids" that have highest "num_token_masked" "scores"
             select_masked_indices = generate_src_mask(sorted_score_indices.shape[1], num_token_masked)
             # repeat last_id to make it scatter_ the existing last ids
             last_index = sorted_score_indices.gather(-1, num_token_masked.unsqueeze(-1) - 1)
             sorted_score_indices = sorted_score_indices * select_masked_indices + (last_index * ~select_masked_indices)
-            ids.scatter_(-1, sorted_score_indices, mask_id)
+            token_ids_m.scatter_(-1, sorted_score_indices, mask_id)
 
             if first == 'motion':
-                src_mask = torch.cat([seq_mask, seq_mask_t], dim=1)
+                src_mask = torch.cat([seq_mask_m, seq_mask_t], dim=1)
             elif first == 'text':
-                src_mask = torch.cat([seq_mask_t, seq_mask], dim=1)
+                src_mask = torch.cat([seq_mask_t, seq_mask_m], dim=1)
             else:
                 raise RuntimeError(f'The order of the two modalities is not assigned.')
 
-            # (bs, max_m, vocab)
-            att_txt = torch.empty(batch_size, 0, dtype=torch.bool,
-                                  device=valid_length.device)  # empty mask for original MMM's CLS token
-            pred_m, _ = self.forward(ids, src_mask=src_mask, att_txt=att_txt, word_emb=word_emb, first=first, max_m=max_m, max_t=max_t)
+            pred_m, _ = self.forward(token_ids_m,
+                                     src_mask=src_mask,
+                                     att_txt=torch.empty(batch_size, 0, dtype=torch.bool, device=lens_m.device),  # empty mask for CLS token
+                                     word_emb=word_emb,
+                                     first=first,
+                                     max_m=max_m,
+                                     max_t=max_t)
 
             if rand_pos:
                 temperature = 1  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
@@ -389,17 +405,96 @@ class Text2Motion_Transformer(nn.Module):
                 temperature = 0  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
 
             # if temperature == 0, it is equal to argmax (pred_ids = pred_m.argmax(dim=-1))
-            pred_ids = gumbel_sample(pred_m, temperature=temperature, dim=-1)
-            is_mask = ids == mask_id
+            pred_ids_m = gumbel_sample(pred_m, temperature=temperature, dim=-1)
+            is_mask = token_ids_m == mask_id
 
-            ids = torch.where(is_mask, pred_ids, ids)
+            token_ids_m = torch.where(is_mask, pred_ids_m, token_ids_m)
 
-            # probs_without_temperature = pred_m.softmax(dim=-1)
-            # scores = 1 - probs_without_temperature.gather(-1, pred_ids[..., None])
-            # scores = rearrange(scores, '... 1 -> ...')
-            # scores = scores.masked_fill(~is_mask, 0)
+        return token_ids_m
 
-        return ids
+    def sample_t(self, special_ids=None, lens_t=None, token_ids_m=None, seq_mask_m=None,
+                 max_m=50, max_t=77, rand_pos=True, token_cond=None, max_steps=10, first=None):
+        batch_size = lens_t.shape[0]
+
+        # generate target token masks
+        shape = (batch_size, max_t)
+        seq_mask_t = generate_src_mask(max_t, lens_t + 1)  # target token: text
+        seq_mask_no_end_t = generate_src_mask(max_t, lens_t)  # target token: text
+
+        scores = torch.ones(shape, dtype=torch.float32, device=lens_t.device)
+
+        # init text token ids
+        if token_cond is not None:  # has partial condition
+            token_ids_t = token_cond.clone()
+            token_ids_t[~seq_mask_no_end_t] = special_ids['pad_id']
+            num_token_cond = (token_ids_t == special_ids['mask_id']).sum(-1)
+        else:  # start from full mask
+            token_ids_t = torch.full(shape, special_ids['mask_id'], dtype=torch.long, device=lens_t.device)
+            token_ids_t[:, 0] = special_ids['cls_id']  # add [CLS] token for text
+
+        ## TODO: confirm that these 2 lines are not necessary (repeated below and maybe don't need them at all)
+        token_ids_t[~seq_mask_t] = special_ids['pad_id']                           # replace with pad id
+        token_ids_t.scatter_(-1, lens_t[..., None].long(), special_ids['eos_id'])  # replace with end id
+
+        sample_max_steps = torch.round(max_steps / max_t * lens_t) + 1e-8
+        for step in range(max_steps):
+            timestep = torch.clip(step / sample_max_steps, max=1)
+            if len(lens_t) == 1 and step > 0 and torch.clip(step - 1 / sample_max_steps, max=1).cpu().item() == timestep:
+                break
+            rand_mask_prob = cosine_schedule(timestep)
+            num_token_masked = (rand_mask_prob * lens_t).long().clip(min=1)
+
+            if token_cond is not None:
+                num_token_masked = (rand_mask_prob * num_token_cond).long().clip(min=1)
+                scores[token_cond != special_ids['mask_id']] = 0
+
+            # Set sampling score to 0 for [PAD] and [CLS]
+            scores[~seq_mask_no_end_t] = 0
+            scores[:, 0] = 0
+            scores = scores / scores.sum(-1)[:, None]  # normalize only unmasked token
+
+            _, sorted_score_indices = scores.sort(descending=True)  # deterministic
+
+            token_ids_t[~seq_mask_t] = special_ids['pad_id']                           # replace with pad id
+            token_ids_t.scatter_(-1, lens_t[..., None].long(), special_ids['eos_id'])  # replace with end id
+
+            # replace "mask_id" to "ids" that have highest "num_token_masked" "scores"
+            select_masked_indices = generate_src_mask(sorted_score_indices.shape[1], num_token_masked)
+            # repeat last_id to make it scatter_ the existing last ids
+            last_index = sorted_score_indices.gather(-1, num_token_masked.unsqueeze(-1) - 1)
+            sorted_score_indices = sorted_score_indices * select_masked_indices + (last_index * ~select_masked_indices)
+            token_ids_t.scatter_(-1, sorted_score_indices, special_ids['mask_id'])
+
+            # Get text embeddings from ModernBERT
+            t_emb = self.bert(input_ids=token_ids_t, attention_mask=seq_mask_t)
+
+            if first == 'motion':
+                src_mask = torch.cat([seq_mask_m, seq_mask_t], dim=1)
+            elif first == 'text':
+                src_mask = torch.cat([seq_mask_t, seq_mask_m], dim=1)
+            else:
+                raise RuntimeError(f'The order of the two modalities is not assigned.')
+
+            _, pred_t = self.forward(token_ids_m,
+                                     src_mask=src_mask,
+                                     att_txt=torch.empty(batch_size, 0, dtype=torch.bool, device=lens_t.device),  # empty mask for CLS token
+                                     word_emb=t_emb,
+                                     first=first,
+                                     max_m=max_m,
+                                     max_t=max_t)  # (bs, max_t, vocab)
+
+            if rand_pos:
+                temperature = 1  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
+            else:
+                temperature = 0  # starting_temperature * (steps_until_x0 / timesteps)  # temperature is annealed
+
+            # if temperature == 0, it is equal to argmax (pred_ids = pred_m.argmax(dim=-1))
+            pred_ids_t = gumbel_sample(pred_t, temperature=temperature, dim=-1)
+            is_mask = token_ids_t == special_ids['mask_id']
+
+            token_ids_t = torch.where(is_mask, pred_ids_t, token_ids_t)
+
+        return token_ids_t
 
     def inpaint(self, first_tokens, last_tokens, clip_feature=None, word_emb=None, inpaint_len=2, rand_pos=False):
         # support only one sample

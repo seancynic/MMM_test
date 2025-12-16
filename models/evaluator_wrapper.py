@@ -74,9 +74,10 @@ class EvaluatorModelWrapper(object):
 
             '''Text Encoding'''
             text_embedding = self.text_encoder(word_embs, pos_ohot, cap_lens)
+
         return text_embedding, motion_embedding
 
-    # Please note that the results does not following the order of inputs
+    # Please note that the results does not follow the order of inputs
     def get_motion_embeddings(self, motions, m_lens):
         with torch.no_grad():
             motions = motions.detach().to(self.device).float()
@@ -89,4 +90,5 @@ class EvaluatorModelWrapper(object):
             movements = self.movement_encoder(motions[..., :-4]).detach()
             m_lens = m_lens // self.opt.unit_length
             motion_embedding = self.motion_encoder(movements, m_lens)
+
         return motion_embedding

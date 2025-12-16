@@ -13,11 +13,11 @@ from options.get_eval_option import get_opt
 from models.evaluator_wrapper import EvaluatorModelWrapper
 from dataset import dataset_TM_train, dataset_TM_eval, dataset_tokenize
 from exit.utils import get_model, generate_src_mask, init_save_folder
-from utils.eval_trans import eval_trans_m
+from utils.eval_trans import eval_trans_m, eval_trans_t
 
 from tqdm import tqdm
 from einops import rearrange
-from transformers import AutoTokenizer, ModernBertModel
+from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
 
 warnings.filterwarnings('ignore')
@@ -32,12 +32,16 @@ torch.manual_seed(args.seed)
 init_save_folder(args)
 
 args.vq_dir = f'./output/vq/{args.vq_name}'
-codebook_dir = f'{args.vq_dir}/codebook/'
 args.resume_pth = f'{args.vq_dir}/net_last.pth'
+codebook_train_dir = f'{args.vq_dir}/codebook_train/'
+codebook_val_dir = f'{args.vq_dir}/codebook_val/'
+codebook_test_dir = f'{args.vq_dir}/codebook_test/'
 os.makedirs(args.vq_dir, exist_ok=True)
-os.makedirs(codebook_dir, exist_ok=True)
 os.makedirs(args.out_dir, exist_ok=True)
 os.makedirs(f'{args.out_dir}/html', exist_ok=True)
+os.makedirs(codebook_train_dir, exist_ok=True)
+os.makedirs(codebook_val_dir, exist_ok=True)
+os.makedirs(codebook_test_dir, exist_ok=True)
 
 ##### ---- Logger ---- #####
 logger = utils_model.get_logger(args.out_dir)
@@ -55,31 +59,6 @@ w_vectorizer = WordVectorizer('./glove', 'our_vab')
 ##### ---- ModernBERT ---- #####
 model_name = 'answerdotai/modernbert-base'
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-modernbert = ModernBertModel.from_pretrained(model_name).to(device).half()  # float16
-modernbert.eval()
-for p in modernbert.parameters():
-    p.requires_grad = False
-
-class TextModernBERT(torch.nn.Module):
-    def __init__(self, model):
-        super(TextModernBERT, self).__init__()
-        self.model = model
-
-    def forward(self, input_ids, attention_mask):
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids,
-                                 attention_mask=attention_mask,
-                                 output_hidden_states=False,
-                                 return_dict=True)
-        return outputs.last_hidden_state.float()  # (bs, max_t, dim)
-
-bert = TextModernBERT(modernbert)
-# print(f'ModernBERT vocab_size: {bert.model.config.vocab_size}')
-# print(f'ModernBERT hidden_size: {bert.model.config.hidden_size}')
-# print(f'ModernBERT mask_token_id: {tokenizer.mask_token_id}')
-# print(f'ModernBERT pad_token_id: {bert.model.config.pad_token_id}')
-# print(f'ModernBERT eos_token_id: {bert.model.config.eos_token_id}')
-# print(f'ModernBERT sep_token_id: {bert.model.config.sep_token_id}')
 
 ##### ---- VQ-VAE ---- #####
 net = vqvae.HumanVQVAE(args,  # use args to define different parameters in different quantizers
@@ -101,9 +80,7 @@ net.eval()
 ##### ---- Text2Motion Transformer ---- #####
 trans_encoder = trans.Text2Motion_Transformer(vqvae=net,
                                               num_vq=args.nb_code,
-                                              num_vt=bert.model.config.vocab_size,
                                               embed_dim=args.embed_dim_gpt,
-                                              clip_dim=bert.model.config.hidden_size,
                                               block_size=args.block_size,
                                               num_layers=args.num_layers,
                                               num_local_layer=0,
@@ -123,20 +100,20 @@ trans_encoder = torch.nn.DataParallel(trans_encoder)
 optimizer = utils_model.initial_optim(args.decay_option, args.lr, args.weight_decay, trans_encoder, args.optimizer)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_scheduler, gamma=args.gamma)
 
-##### ---- get code ---- #####
-if len(os.listdir(codebook_dir)) == 0:
-    train_loader_token = dataset_tokenize.DATALoader(args.dataname, 1, unit_length=2**args.down_t)
-    for batch in train_loader_token:
-        pose, name = batch
-        bs, seq = pose.shape[0], pose.shape[1]
-
-        pose = pose.to(device).float()  # bs, nb_joints, joints_dim, seq_len
-        target = net(pose, type='encode')
-        target = target.cpu().numpy()
-        np.save(os.path.join(codebook_dir, f'{name[0]}.npy'), target)
+##### ---- get codebook ---- #####
+codebooks = {'train': codebook_train_dir, 'val': codebook_val_dir, 'test': codebook_test_dir}
+for type, codebook_dir in codebooks.items():
+    if len(os.listdir(codebook_dir)) == 0:
+        dataloader_token = dataset_tokenize.DATALoader(args.dataname, type=type, batch_size=1, unit_length=2 ** args.down_t)
+        for batch in dataloader_token:
+            pose, name = batch
+            pose = pose.to(device).float()  # bs, nb_joints, joints_dim, seq_len
+            target = net(pose, type='encode')
+            target = target.cpu().numpy()
+            np.save(os.path.join(codebook_dir, f'{name[0]}.npy'), target)
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_TM_train.DATALoader(args.dataname, args.batch_size, args.nb_code, codebook_dir, unit_length=2**args.down_t)
+train_loader = dataset_TM_train.DATALoader(args.dataname, codebook_train_dir, args.nb_code, args.batch_size, unit_length=2**args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
 
 ##### ---- Training ---- #####
@@ -160,7 +137,7 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
     if max_len == args.max_t:
         seq_mask_no_end[:, 0] = False  # exclude [CLS] token for text
         mask = torch.logical_or(mask, ~seq_mask_no_end).int()
-        r_indices = torch.randint_like(ids, bert.model.config.vocab_size)
+        r_indices = torch.randint_like(ids, trans_encoder.module.bert.vocab_size)
     else:
         mask = torch.logical_or(mask, ~seq_mask_no_end).int()
         r_indices = torch.randint_like(ids, args.nb_code)
@@ -196,8 +173,18 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
 
     return right_seq_masked
 
-def train(first_modality, mask_probs, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching):
+def train(first_modality, mask_probs):
+    # Get masking probabilities
     probs_m, probs_t = mask_probs[0], mask_probs[1]
+
+    # Get special ids for text
+    special_ids_t = {
+        'mask_id': tokenizer.mask_token_id,
+        'cls_id': trans_encoder.module.bert.cls_id,
+        'eos_id': trans_encoder.module.bert.eos_id,
+        'pad_id': trans_encoder.module.bert.pad_id
+    }
+    invalid_ids_t = [special_ids_t['eos_id'], special_ids_t['pad_id']]
 
     for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
         batch = next(train_loader_iter)
@@ -214,8 +201,7 @@ def train(first_modality, mask_probs, best_fid, best_iter, best_div, best_top1, 
         seq_mask_t = text_inputs['attention_mask'].to(device)  # (bs, max_t)
 
         # Get lengths for each text in batch
-        invalid_ids = [bert.model.config.pad_token_id, bert.model.config.eos_token_id, bert.model.config.sep_token_id]
-        valid_mask_t = ~torch.isin(token_ids_t, torch.tensor(invalid_ids, device=device))
+        valid_mask_t = ~torch.isin(token_ids_t, torch.tensor(invalid_ids_t, device=device))
         lens_t = valid_mask_t.sum(dim=1)  # (bs,)
 
         # Mask
@@ -231,7 +217,7 @@ def train(first_modality, mask_probs, best_fid, best_iter, best_div, best_top1, 
             raise RuntimeError(f'The order of the two modalities is not assigned.')
 
         # Get text embeddings from ModernBERT
-        emb_t = bert(input_ids=masked_input_ids_t, attention_mask=seq_mask_t)
+        emb_t = trans_encoder.module.bert(input_ids=masked_input_ids_t, attention_mask=seq_mask_t)
 
         # Train trans: forward
         pred_m, pred_t = trans_encoder(masked_input_ids_m,
@@ -282,26 +268,36 @@ def train(first_modality, mask_probs, best_fid, best_iter, best_div, best_top1, 
             if nb_iter == args.total_iter:
                 num_repeat = -30
                 rand_pos = True
-                val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, is_test=True, batch_size=32,
-                                                           w_vectorizer=w_vectorizer, tokenizer=tokenizer, max_t=args.max_t)
+                val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer, args.nb_code,
+                                                           batch_size=32, is_test=True, tokenizer_t=tokenizer, max_t=args.max_t)
             else:
                 num_repeat = 1
                 rand_pos = False
-                val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, is_test=False, batch_size=32,
-                                                           w_vectorizer=w_vectorizer, tokenizer=tokenizer, max_t=args.max_t)
+                val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_val_dir, w_vectorizer, args.nb_code,
+                                                           batch_size=32, is_test=False, tokenizer_t=tokenizer, max_t=args.max_t)
 
-            best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_trans_m(
+            best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_trans_m(
                 args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
-                best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching,
-                bert, max_m, args.max_t, eval_wrapper, first_modality, num_repeat=num_repeat, rand_pos=rand_pos)
+                eval_wrapper, max_m, args.max_t, first_modality,
+                num_repeat=num_repeat, rand_pos=rand_pos)
 
-        if nb_iter == args.total_iter:
-            msg_final = (f"Train. Iter {best_iter} : FID. {best_fid:.5f}, Diversity. {best_div:.4f}, "
-                         f"TOP1. {best_top1:.4f}, TOP2. {best_top2:.4f}, TOP3. {best_top3:.4f}")
-            logger.info(msg_final)
-            break
+            best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l = eval_trans_t(
+                args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
+                eval_wrapper, tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t, first_modality,
+                num_repeat=num_repeat, rand_pos=rand_pos)
+
+            if nb_iter == args.total_iter:
+                msg_final = (f"Train (t2m). Iter {best_iter_m} : FID. {best_fid:.5f}, Diversity. {best_div:.4f}, "
+                             f"TOP1. {best_top1:.4f}, TOP2. {best_top2:.4f}, TOP3. {best_top3:.4f}")
+                logger.info(msg_final)
+
+                msg_final = (f"Train (m2t). Iter {best_iter_t} : BLEU1. {best_bleu1:.5f}, BLEU2. {best_bleu2:.4f}, "
+                             f"BLEU3. {best_bleu3:.4f}, BLEU4. {best_bleu4:.4f}, ROUGE_L. {best_rouge_l:.4f}")
+                logger.info(msg_final)
+                break
 
 # Training Step 1: mix training
-bests = train(first_modality='motion',  # "motion" or "text"
-              mask_probs=[[0.5, 1], [0.5, 1]],  # [[prob_lb_m, prob_ub_m], [prob_lb_t, prob_ub_t]]
-              best_fid=1000, best_iter=0, best_div=100, best_top1=0, best_top2=0, best_top3=0, best_matching=100)
+bests = train(
+    first_modality='motion',               # "motion" first or "text" first
+    mask_probs=((0.0001, 1), (0.0001, 1))  # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
+)

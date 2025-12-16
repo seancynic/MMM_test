@@ -1,15 +1,13 @@
-import torch
-from torch.utils import data
-import numpy as np
-from os.path import join as pjoin
 import random
+import numpy as np
 import codecs as cs
 from tqdm import tqdm
+from os.path import join as pjoin
+from torch.utils.data import Dataset, DataLoader
 
 
-
-class VQMotionDataset(data.Dataset):
-    def __init__(self, dataset_name, feat_bias = 5, window_size = 64, unit_length = 8, fill_max_len=False):
+class VQMotionDataset(Dataset):
+    def __init__(self, dataset_name, type, feat_bias=5, window_size=64, unit_length=8, fill_max_len=False):
         self.window_size = window_size
         self.unit_length = unit_length
         self.feat_bias = feat_bias
@@ -40,13 +38,18 @@ class VQMotionDataset(data.Dataset):
             self.max_motion_length = 196
             self.meta_dir = 'checkpoints/kit/VQVAEV3_CB1024_CMT_H1024_NRES3/meta'
             #kinematic_chain = paramUtil.kit_kinematic_chain
-        
-        joints_num = self.joints_num
 
         mean = np.load(pjoin(self.meta_dir, 'mean.npy'))
         std = np.load(pjoin(self.meta_dir, 'std.npy'))
         
-        split_file = pjoin(self.data_root, 'train.txt')
+        if type == 'train':
+            split_file = pjoin(self.data_root, 'train.txt')
+        elif type == 'val':
+            split_file = pjoin(self.data_root, 'val.txt')
+        elif type == 'test':
+            split_file = pjoin(self.data_root, 'test.txt')
+        else:
+            raise RuntimeError(f'Type should be train, val or test.')
         
         data_dict = {}
         id_list = []
@@ -71,7 +74,6 @@ class VQMotionDataset(data.Dataset):
                 # Some motion may not exist in KIT dataset
                 pass
 
-
         self.mean = mean
         self.std = std
         self.length_arr = np.array(length_list)
@@ -92,7 +94,7 @@ class VQMotionDataset(data.Dataset):
         m_length = (m_length // self.unit_length) * self.unit_length
 
         idx = random.randint(0, len(motion) - m_length)
-        motion = motion[idx:idx+m_length]
+        motion = motion[idx:idx + m_length]
 
         if self.fill_max_len:
             motion_zero = np.zeros((self.max_motion_length, self.dim_pose))
@@ -106,16 +108,9 @@ class VQMotionDataset(data.Dataset):
 
         return motion, name
 
-def DATALoader(dataset_name,
-                batch_size = 1,
-                num_workers = 8, unit_length = 4, shuffle=True) : 
-    
-    train_loader = torch.utils.data.DataLoader(VQMotionDataset(dataset_name, unit_length=unit_length, fill_max_len=batch_size!=1),
-                                              batch_size,
-                                              shuffle=shuffle,
-                                              num_workers=num_workers,
-                                              #collate_fn=collate_fn,
-                                              drop_last = True)
+def DATALoader(dataset_name, type, batch_size=1, num_workers=8, unit_length=4, shuffle=True):
+    train_loader = DataLoader(VQMotionDataset(dataset_name, type, unit_length=unit_length, fill_max_len=batch_size!=1),
+                              batch_size, shuffle=shuffle, num_workers=num_workers, drop_last=True)
     
     return train_loader
 
