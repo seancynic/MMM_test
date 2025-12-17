@@ -518,12 +518,12 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
 
     trans.eval()
     nb_sample = 0
-    # motion_multimodality = []
-    # R_precision_real = 0
-    # R_precision = 0
-    # matching_score_real = 0
-    # matching_score_pred = 0
+
     bleu1, bleu2, bleu3, bleu4, rouge_l = 0., 0., 0., 0., 0.
+
+    metric_batches = []
+
+    rouge_scorer_obj = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
 
     for batch in tqdm(val_loader, position=2, leave=True):
         word_embeddings, pos_one_hots, sent_len, token_ids_m, pose, m_length, input_ids, input_attn_mask, captions = batch
@@ -543,51 +543,17 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
 
             pred_text = decode_token_ids(index_text, tokenizer, pad_token_id=special_ids['pad_id'], eos_token_id=special_ids['eos_id'])
 
-            # # [INFO] need to run single sample at a time because it's conv
-            # pred_pose_eval = torch.zeros(pose.shape).cuda()
-            # for k in range(bs):
-            #     # [INFO] Eval by m_length
-            #     pred_pose = net(index_motion[k:k + 1, :lens_m[k].item()], type='decode')  # (1, m_length, dim_m)
-            #     pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose  # (bs, m_length, dim_m)
-            #
-            # et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
-            #
-            # motion_multimodality_batch.append(em_pred.reshape(bs, 1, -1))
-
             if i == 0 or is_avg_all:
-                # pose = pose.cuda().float()
-                #
-                # et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
-                #
-                # temp_R, temp_match = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
-                # R_precision_real += temp_R
-                # matching_score_real += temp_match
-                #
-                # temp_R, temp_match = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
-                # R_precision += temp_R
-                # matching_score_pred += temp_match
-
-                rouge_l += compute_rouge_l(pred_text, captions)
-                bleu_scores = compute_bleu_scores(pred_text, captions)
-                bleu1 += bleu_scores['BLEU-1']
-                bleu2 += bleu_scores['BLEU-2']
-                bleu3 += bleu_scores['BLEU-3']
-                bleu4 += bleu_scores['BLEU-4']
-
+                metric_batches.append((pred_text, captions, bs))
                 nb_sample += bs
 
-    #     motion_multimodality.append(torch.cat(motion_multimodality_batch, dim=1))
-    #
-    # R_precision_real = R_precision_real / nb_sample
-    # R_precision = R_precision / nb_sample
-    #
-    # matching_score_real = matching_score_real / nb_sample
-    # matching_score_pred = matching_score_pred / nb_sample
-    #
-    # multimodality = 0
-    # motion_multimodality = torch.cat(motion_multimodality, dim=0).cpu().numpy()
-    # if num_repeat > 1:
-    #     multimodality = calculate_multimodality(motion_multimodality, 10)
+    for pred_text, captions, bs in metric_batches:
+        rouge_l += compute_rouge_l(pred_text, captions, scorer=rouge_scorer_obj)
+        bleu_scores = compute_bleu_scores(pred_text, captions)
+        bleu1 += bleu_scores['BLEU-1']
+        bleu2 += bleu_scores['BLEU-2']
+        bleu3 += bleu_scores['BLEU-3']
+        bleu4 += bleu_scores['BLEU-4']
 
     bleu1 = bleu1 / nb_sample
     bleu2 = bleu2 / nb_sample
@@ -595,12 +561,6 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
     bleu4 = bleu4 / nb_sample
     rouge_l = rouge_l / nb_sample
 
-    # msg = f"--> \t Eva. Iter {nb_iter} :, \n\
-    #             R_precision_real. {R_precision_real}, \n\
-    #             R_precision. {R_precision}, \n\
-    #             matching_score_real. {matching_score_real}, \n\
-    #             matching_score_pred. {matching_score_pred}, \n\
-    #             multimodality. {multimodality:.4f}"
     msg = f"--> \t Eva. Iter {nb_iter} :, \n\
                 bleu1. {bleu1}, \n\
                 bleu2. {bleu2}, \n\
@@ -610,36 +570,11 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
     logger.info(msg)
 
     if draw:
-        # writer.add_scalar('./Test/top1', R_precision[0], nb_iter)
-        # writer.add_scalar('./Test/top2', R_precision[1], nb_iter)
-        # writer.add_scalar('./Test/top3', R_precision[2], nb_iter)
-        # writer.add_scalar('./Test/matching_score', matching_score_pred, nb_iter)
-        # writer.add_scalar('./Test/multimodality', multimodality, nb_iter)
         writer.add_scalar('./Test/bleu1', bleu1, nb_iter)
         writer.add_scalar('./Test/bleu2', bleu2, nb_iter)
         writer.add_scalar('./Test/bleu3', bleu3, nb_iter)
         writer.add_scalar('./Test/bleu4', bleu4, nb_iter)
         writer.add_scalar('./Test/rouge_l', rouge_l, nb_iter)
-
-    # if matching_score_pred < best_matching:
-    #     msg = f"--> --> \t matching_score Improved from {best_matching:.5f} to {matching_score_pred:.5f} !!!"
-    #     logger.info(msg)
-    #     best_matching = matching_score_pred
-
-    # if R_precision[0] > best_top1:
-    #     msg = f"--> --> \t Top1 Improved from {best_top1:.4f} to {R_precision[0]:.4f} !!!"
-    #     logger.info(msg)
-    #     best_top1 = R_precision[0]
-
-    # if R_precision[1] > best_top2:
-    #     msg = f"--> --> \t Top2 Improved from {best_top2:.4f} to {R_precision[1]:.4f} !!!"
-    #     logger.info(msg)
-    #     best_top2 = R_precision[1]
-
-    # if R_precision[2] > best_top3:
-    #     msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
-    #     logger.info(msg)
-    #     best_top3 = R_precision[2]
 
     if bleu1 > best_bleu1:
         msg = f"--> --> \t BLEU1 Improved from {best_bleu1:.4f} to {bleu1:.4f} !!!"
@@ -1167,8 +1102,10 @@ def compute_bleu_scores(preds, refs):
         "BLEU-4": bleu4 / len(preds),
     }
 
-def compute_rouge_l(preds, refs):
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+def compute_rouge_l(preds, refs, scorer = None):
+    if scorer is None:
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+
     rouge_l_f = 0.0
 
     for pred, ref in zip(preds, refs):

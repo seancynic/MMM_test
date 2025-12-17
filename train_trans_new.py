@@ -334,6 +334,6 @@ def train(first_modality, mask_probs):
 # Training Step 1: mix training
 bests = train(
     first_modality='motion',  # "motion" first or "text" first
-    mask_probs=((0.0001, 1), (0.0001, 1))
+    mask_probs=((0.5, 1), (0.0001, 1))
     # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
 )
