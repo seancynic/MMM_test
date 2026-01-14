@@ -13,6 +13,17 @@ from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu
 from rouge_score import rouge_scorer
 
+try:
+    from nlgmetricverse import NLGMetricverse, load_metric
+except ImportError:
+    NLGMetricverse = None
+    load_metric = None
+
+try:
+    # the bert_score package exposes a `score` function
+    from bert_score import score as bert_score
+except ImportError:
+    bert_score = None
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -178,6 +189,7 @@ def evaluation_transformer(out_dir, val_loader, net, trans, logger, writer, nb_i
         num_repeat = -num_repeat
     else:
         is_avg_all = False
+
 
 
     trans.eval()
@@ -508,7 +520,7 @@ def eval_trans_m(out_dir, val_loader, net, trans, logger, writer, nb_iter,
 @torch.no_grad()
 def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
                  eval_wrapper, tokenizer, special_ids, invalid_ids, max_m, max_t, first,
-                 best_iter=0., best_bleu1=0., best_bleu2=0., best_bleu3=0., best_bleu4=0., best_rouge_l=0.,
+                 best_iter=0., best_bleu1=0., best_bleu2=0., best_bleu3=0., best_bleu4=0., best_rouge_l=0., best_cider=0., best_bert_f1=0.,
                  draw=True, save=True, num_repeat=1, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
         is_avg_all = True
@@ -516,10 +528,22 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
     else:  # evaluate last generation
         is_avg_all = False
 
+    # set up evaluators for CIDEr and BERT F1 if the libraries are available
+    if NLGMetricverse is not None and load_metric is not None:
+        # Only the CIDEr metric is loaded here; BLEU and ROUGE are computed elsewhere
+        _cider_metrics = [load_metric("cider")]
+        nlg_evaluator = NLGMetricverse(_cider_metrics)
+    else:
+        nlg_evaluator = None
+
+    # bert_score is a function imported above, it will be None if the package is missing
+
     trans.eval()
     nb_sample = 0
 
     bleu1, bleu2, bleu3, bleu4, rouge_l = 0., 0., 0., 0., 0.
+    cider_score = 0.
+    bert_f1 = 0.
 
     metric_batches = []
 
@@ -555,18 +579,36 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
         bleu3 += bleu_scores['BLEU-3']
         bleu4 += bleu_scores['BLEU-4']
 
-    bleu1 = bleu1 / nb_sample
+        # compute CIDEr using nlgmetricverse (if available)
+        if nlg_evaluator is not None:
+            # nlg_evaluator returns a dict keyed by metric names
+            _scores = nlg_evaluator(predictions=pred_text, references=captions)
+            cider_value = _scores["cider"]["score"]
+            cider_score += cider_value
+        # compute BERT F1 using bert_score (if available)
+        if bert_score is not None:
+            P, R, F1 = bert_score(pred_text, captions, lang="en",
+                                  rescale_with_baseline=True, idf=True,
+                                  verbose=False)
+            bert_f1 += F1.mean().item()
+
     bleu2 = bleu2 / nb_sample
     bleu3 = bleu3 / nb_sample
     bleu4 = bleu4 / nb_sample
     rouge_l = rouge_l / nb_sample
+
+    cider_score = cider_score / nb_sample if nb_sample > 0 else 0.0
+    bert_f1 = bert_f1 / nb_sample if nb_sample > 0 else 0.0
 
     msg = f"--> \t Eva. Iter {nb_iter} :, \n\
                 bleu1. {bleu1}, \n\
                 bleu2. {bleu2}, \n\
                 bleu3. {bleu3}, \n\
                 bleu4. {bleu4}, \n\
-                rouge_l. {rouge_l:.4f}"
+                rouge_l. {rouge_l:.4f}, \n\
+                cidEr. {cider_score:.4f}, \n\
+                bert_f1. {bert_f1:.4f}"
+
     logger.info(msg)
 
     if draw:
@@ -575,6 +617,8 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
         writer.add_scalar('./Test/bleu3', bleu3, nb_iter)
         writer.add_scalar('./Test/bleu4', bleu4, nb_iter)
         writer.add_scalar('./Test/rouge_l', rouge_l, nb_iter)
+        writer.add_scalar('./Test/cider', cider_score, nb_iter)
+        writer.add_scalar('./Test/bert_f1', bert_f1, nb_iter)
 
     if bleu1 > best_bleu1:
         msg = f"--> --> \t BLEU1 Improved from {best_bleu1:.4f} to {bleu1:.4f} !!!"
@@ -601,12 +645,22 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
         logger.info(msg)
         best_rouge_l = rouge_l
 
+    if cider_score > best_cider:
+        msg = f"--> -->\tCIDEr Improved from {best_cider:.4f} to {cider_score:.4f} !!!"
+        logger.info(msg)
+        best_cider = cider_score
+
+    if bert_f1 > best_bert_f1:
+        msg = f"--> -->\tBERT_F1 Improved from {best_bert_f1:.4f} to {bert_f1:.4f} !!!"
+        logger.info(msg)
+        best_bert_f1 = bert_f1
+
     if save:
         torch.save({'trans': get_model(trans).state_dict()}, os.path.join(out_dir, 'net_last_t.pth'))
 
     trans.train()
     # return best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, multimodality
-    return best_iter, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l
+    return best_iter, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1
 
 def evaluation_transformer_uplow(out_dir, val_loader, net, trans, logger, writer, nb_iter, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, clip_model, eval_wrapper, dataname, draw = True, save = True, savegif=False, num_repeat=1, rand_pos=False, CFG=-1) :
     from utils.humanml_utils import HML_UPPER_BODY_MASK, HML_LOWER_BODY_MASK

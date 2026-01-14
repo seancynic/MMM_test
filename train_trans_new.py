@@ -212,6 +212,8 @@ def train(first_modality, mask_probs):
     best_bleu3 = 0.
     best_bleu4 = 0.
     best_rouge_l = 0.
+    best_cider = 0.
+    best_bert_f1 = 0.
 
     for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
         batch = next(train_loader_iter)
@@ -317,11 +319,13 @@ def train(first_modality, mask_probs):
                 best_matching=best_matching,
                 num_repeat=num_repeat, rand_pos=rand_pos)
 
-            best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l = eval_trans_t(
+            best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_trans_t(
                 args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
-                eval_wrapper, tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t, first_modality,
-                best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu2=best_bleu2, best_bleu3=best_bleu3,
-                best_bleu4=best_bleu4, best_rouge_l=best_rouge_l,
+                eval_wrapper, tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t,
+                first_modality,
+                best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu2=best_bleu2,
+                best_bleu3=best_bleu3, best_bleu4=best_bleu4, best_rouge_l=best_rouge_l,
+                best_cider=best_cider, best_bert_f1=best_bert_f1,
                 num_repeat=num_repeat, rand_pos=rand_pos)
 
             if nb_iter == args.total_iter:
@@ -334,10 +338,115 @@ def train(first_modality, mask_probs):
                 logger.info(msg_final)
                 break
 
+@torch.no_grad()
+def eval_only(first_modality, split="test"):
+    # ===== special ids for text =====
+    special_ids_t = {
+        'mask_id': tokenizer.mask_token_id,
+        'cls_id': trans_encoder.module.bert.cls_id if isinstance(trans_encoder, torch.nn.DataParallel) else trans_encoder.bert.cls_id,
+        'eos_id': trans_encoder.module.bert.eos_id if isinstance(trans_encoder, torch.nn.DataParallel) else trans_encoder.bert.eos_id,
+        'pad_id': trans_encoder.module.bert.pad_id if isinstance(trans_encoder, torch.nn.DataParallel) else trans_encoder.bert.pad_id,
+    }
+    invalid_ids_t = [special_ids_t['eos_id'], special_ids_t['pad_id']]
+
+    # ===== 选择评估集 =====
+    if split == "test":
+        num_repeat = -30
+        rand_pos = True
+        codebook_dir = codebook_test_dir
+        is_test = True
+    else:
+        num_repeat = 1
+        rand_pos = False
+        codebook_dir = codebook_val_dir
+        is_test = False
+
+    # ===== dataloader =====
+    val_loader = dataset_TM_eval.DATALoaderNew(
+        args.dataname, codebook_dir, w_vectorizer, args.nb_code,
+        batch_size=32, is_test=is_test, tokenizer_t=tokenizer, max_t=args.max_t
+    )
+
+    # ===== 切到 eval 模式 =====
+    net.eval()
+    trans_encoder.eval()
+
+    # max_m：eval_trans_m / eval_trans_t 要用到 max_m
+    # 你原来是从 train batch 里拿 max_m，这里我们直接用一个常见默认（通常是 50）
+    # 如果你 args 里有 max_m 或 block_size 对应的 motion 长度，也可以改成 args.max_m
+    max_m = 50
+
+    # ===== 初始化 best 值（eval_only不需要“best”，但保持函数签名兼容）=====
+    best_fid = 1000
+    best_iter_m = 0
+    best_div = 100
+    best_top1 = 0
+    best_top2 = 0
+    best_top3 = 0
+    best_matching = 100
+
+    best_iter_t = 0
+    best_bleu1 = 0.
+    best_bleu2 = 0.
+    best_bleu3 = 0.
+    best_bleu4 = 0.
+    best_rouge_l = 0.
+    best_cider = 0.
+    best_bert_f1 = 0.
+
+    nb_iter = 0  # 只是日志用
+
+    # ===== motion 侧评估 =====
+    best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_trans_m(
+        args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
+        eval_wrapper, max_m, args.max_t, first_modality,
+        best_iter=best_iter_m, best_fid=best_fid,
+        best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
+        best_matching=best_matching,
+        num_repeat=num_repeat, rand_pos=rand_pos
+    )
+
+    # ===== text 侧评估 =====
+    best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_trans_t(
+        args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
+        eval_wrapper, tokenizer, special_ids_t, invalid_ids_t,
+        max_m, args.max_t, first_modality,
+        best_iter=best_iter_t,
+        best_bleu1=best_bleu1, best_bleu2=best_bleu2, best_bleu3=best_bleu3, best_bleu4=best_bleu4,
+        best_rouge_l=best_rouge_l,
+        best_cider=best_cider, best_bert_f1=best_bert_f1,
+        num_repeat=num_repeat, rand_pos=rand_pos
+    )
+
+    # ===== 打印汇总 =====
+    logger.info(
+        f"[EVAL {split}] (t2m) FID {best_fid:.5f}, Div {best_div:.4f}, "
+        f"TOP1 {best_top1:.4f}, TOP2 {best_top2:.4f}, TOP3 {best_top3:.4f}, Match {best_matching:.4f}"
+    )
+    logger.info(
+        f"[EVAL {split}] (m2t) BLEU1 {best_bleu1:.5f}, BLEU2 {best_bleu2:.4f}, BLEU3 {best_bleu3:.4f}, "
+        f"BLEU4 {best_bleu4:.4f}, ROUGE_L {best_rouge_l:.4f}, CIDEr {best_cider:.4f}, BERT_F1 {best_bert_f1:.4f}"
+    )
+
+    return {
+        "fid": float(best_fid),
+        "div": float(best_div),
+        "top1": float(best_top1),
+        "top2": float(best_top2),
+        "top3": float(best_top3),
+        "matching": float(best_matching),
+        "bleu1": float(best_bleu1),
+        "bleu2": float(best_bleu2),
+        "bleu3": float(best_bleu3),
+        "bleu4": float(best_bleu4),
+        "rouge_l": float(best_rouge_l),
+        "cider": float(best_cider),
+        "bert_f1": float(best_bert_f1),
+    }
 
 # Training Step 1: mix training
 bests = train(
     first_modality='motion',  # "motion" first or "text" first
-    mask_probs=((0.5, 1), (0.0001, 1))  # (0, 0) for no mask
+    mask_probs=((0, 0), (0.5, 1))
     # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
 )
