@@ -184,6 +184,80 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
 
     return right_seq_masked
 
+@torch.no_grad()
+def compute_eval_loss(val_loader, first_modality):
+    trans_encoder.eval()
+    total_loss_m = total_loss_t = 0.0
+    total_weight_m = total_weight_t = 0.0
+
+    for batch in val_loader:
+        (_, _, _, m_tokens, _, _, token_ids_t, att_mask_t, _) = batch
+        m_tokens = m_tokens.to(device)
+        token_ids_t = token_ids_t.to(device)
+        att_mask_t = att_mask_t.to(device)
+        bs, max_m = m_tokens.shape[:2]
+
+        # motion 序列长度：减去 1 排除 END token
+        lens_m = (m_tokens != (args.nb_code + 1)).sum(dim=1) - 1
+        lens_m = torch.clamp(lens_m, min=1)
+
+        # 文本长度：排除 [CLS]、[EOS]、[PAD] 三类特殊标记
+        cls_id = trans_encoder.module.bert.cls_id
+        eos_id = trans_encoder.module.bert.eos_id
+        pad_id = trans_encoder.module.bert.pad_id
+        invalid_ids = torch.tensor([cls_id, eos_id, pad_id], device=token_ids_t.device)
+        valid_mask_t = ~torch.isin(token_ids_t, invalid_ids)
+        lens_t = valid_mask_t.sum(dim=1)
+
+        # 生成无随机遮盖的掩码
+        mask_id_m = get_model(net).vqvae.num_code + 2
+        mask_id_t = tokenizer.mask_token_id
+        masked_ids_m, seq_mask_no_end_m, seq_mask_m, _ = masking(
+            m_tokens, lens_m, bs, max_m, mask_id_m, probs=(0, 0)
+        )
+        masked_ids_t, seq_mask_no_end_t, _ = masking(
+            token_ids_t, lens_t, bs, args.max_t, mask_id_t, probs=(0, 0)
+        )
+
+        # 构造组合 mask 并前向
+        src_mask = (
+            torch.cat([seq_mask_m, att_mask_t], dim=1)
+            if first_modality == "motion"
+            else torch.cat([att_mask_t, seq_mask_m], dim=1)
+        )
+        emb_t = trans_encoder.module.bert(
+            input_ids=masked_ids_t, attention_mask=att_mask_t
+        )
+        pred_m, pred_t = trans_encoder(
+            masked_ids_m,
+            src_mask=src_mask,
+            att_txt=torch.empty(bs, 0, dtype=torch.bool, device=device),
+            word_emb=emb_t,
+            first=first_modality,
+            max_m=max_m,
+            max_t=args.max_t,
+        )
+
+        # 计算加权交叉熵
+        pred_seq_m, target_seq_m, weight_seq_m = construct_pred_and_label(
+            pred_m, m_tokens, seq_mask_no_end_m
+        )
+        loss_m = F.cross_entropy(pred_seq_m, target_seq_m, reduction="none")
+        total_loss_m += (loss_m * weight_seq_m).sum().item()
+        total_weight_m += weight_seq_m.sum().item()
+
+        pred_seq_t, target_seq_t, weight_seq_t = construct_pred_and_label(
+            pred_t, token_ids_t, seq_mask_no_end_t
+        )
+        loss_t = F.cross_entropy(pred_seq_t, target_seq_t, reduction="none")
+        total_loss_t += (loss_t * weight_seq_t).sum().item()
+        total_weight_t += weight_seq_t.sum().item()
+
+    avg_loss_m = total_loss_m / total_weight_m if total_weight_m > 0 else 0.0
+    avg_loss_t = total_loss_t / total_weight_t if total_weight_t > 0 else 0.0
+    trans_encoder.train()
+    return avg_loss_m, avg_loss_t, avg_loss_m + avg_loss_t
+
 
 def train(first_modality, mask_probs):
     # Get masking probabilities
@@ -299,6 +373,11 @@ def train(first_modality, mask_probs):
             writer.add_scalar('./ACC/no_masked_text', get_acc(pred_t, token_ids_t, no_mask_token_t), nb_iter)
 
         if nb_iter == 0 or nb_iter % args.eval_iter == 0 or nb_iter == args.total_iter:
+            # num_repeat = -30
+            # rand_pos = True
+            # val_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer, args.nb_code,
+            #                                            batch_size=32, is_test=True, tokenizer_t=tokenizer,
+            #                                            max_t=args.max_t)
             if nb_iter == args.total_iter:
                 num_repeat = -30
                 rand_pos = True
@@ -319,14 +398,22 @@ def train(first_modality, mask_probs):
                 best_matching=best_matching,
                 num_repeat=num_repeat, rand_pos=rand_pos)
 
-            best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_trans_t(
-                args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
-                eval_wrapper, tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t,
-                first_modality,
-                best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu2=best_bleu2,
-                best_bleu3=best_bleu3, best_bleu4=best_bleu4, best_rouge_l=best_rouge_l,
-                best_cider=best_cider, best_bert_f1=best_bert_f1,
-                num_repeat=num_repeat, rand_pos=rand_pos)
+            # best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_trans_t(
+            #     args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter,
+            #     eval_wrapper, tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t,
+            #     first_modality,
+            #     best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu2=best_bleu2,
+            #     best_bleu3=best_bleu3, best_bleu4=best_bleu4, best_rouge_l=best_rouge_l,
+            #     best_cider=best_cider, best_bert_f1=best_bert_f1,
+            #     num_repeat=num_repeat, rand_pos=rand_pos)
+
+            # === Compute and log evaluation losses on the validation set ===
+            eval_loss_m, eval_loss_t, eval_loss_all = compute_eval_loss(val_loader, first_modality)
+            writer.add_scalar('./Eval_Loss/motion', eval_loss_m, nb_iter)
+            writer.add_scalar('./Eval_Loss/text', eval_loss_t, nb_iter)
+            writer.add_scalar('./Eval_Loss/all', eval_loss_all, nb_iter)
+            logger.info(
+                f"Eval loss (iter {nb_iter}): M {eval_loss_m:.4f}, T {eval_loss_t:.4f}, All {eval_loss_all:.4f}")
 
             if nb_iter == args.total_iter:
                 msg_final = (f"Train (t2m). Iter {best_iter_m} : FID. {best_fid:.5f}, Diversity. {best_div:.4f}, "
@@ -341,6 +428,6 @@ def train(first_modality, mask_probs):
 # Training Step 1: mix training
 bests = train(
     first_modality='motion',  # "motion" first or "text" first
-    mask_probs=((0, 0), (0.5, 1))
+    mask_probs=((0.5, 1), (0, 0))
     # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
 )
