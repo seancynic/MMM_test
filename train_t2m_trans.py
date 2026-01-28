@@ -50,7 +50,6 @@ writer = SummaryWriter(args.out_dir)
 logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
 from utils.word_vectorizer import WordVectorizer
-
 w_vectorizer = WordVectorizer('./glove', 'our_vab')
 val_loader = dataset_TM_eval.DATALoader(args.dataname, False, 32, w_vectorizer)
 
@@ -166,6 +165,144 @@ def get_acc(cls_pred, target, mask):
     right_num = (cls_pred_index == target_all).sum()
     return right_num * 100 / mask.sum()
 
+@torch.no_grad()
+def compute_eval_loss_mmm(val_loader, variant: str, args, net, trans_encoder, clip_model):
+    """
+    MMM eval loss (motion-only CE), 三个 variant：
+
+    - "nomask": motion不破坏，text正常
+    - "mask_text": motion不破坏，text用空串（弱条件）
+    - "mask_motion": motion所有“内容token” -> MASK_ID，text正常
+
+    返回：avg_loss（加权 CE，权重策略与训练一致）
+    """
+    assert variant in ["nomask", "mask_text", "mask_motion"]
+
+    trans_encoder.eval()
+    clip_model.eval()
+    net.eval()
+
+    mask_id = get_model(net).vqvae.num_code + 2  # 与训练一致：codebook_size + 2
+
+    total_loss = 0.0
+    total_weight = 0.0
+
+    for batch in val_loader:
+        # val loader __getitem__ 返回：
+        # word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token_str, name
+        # collate_fn 后通常是 tensor/list 的 batch
+        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token_str, name = batch
+
+        # caption: list[str]
+        if isinstance(caption, tuple):
+            caption = list(caption)
+
+        motion = motion.cuda().float()
+        m_length = m_length.cuda()
+
+        # 1) 先把连续 motion encode 成训练格式 tokens
+        m_tokens, m_tokens_len = encode_val_motion_to_tokens(motion, m_length, net, args)
+        bs, max_len = m_tokens.shape
+
+        # 2) 生成 mask（与训练一致）
+        seq_mask_no_end = generate_src_mask(max_len, m_tokens_len)        # loss用：只算内容token
+        seq_mask = generate_src_mask(max_len, m_tokens_len + 1)           # attention用：包含 END
+
+        # 3) variant：构造 masked 输入
+        if variant == "mask_motion":
+            masked_input_indices = torch.where(seq_mask_no_end, mask_id, m_tokens)
+            caption_in = caption
+        elif variant == "mask_text":
+            masked_input_indices = m_tokens
+            caption_in = [""] * bs
+        else:  # "nomask"
+            masked_input_indices = m_tokens
+            caption_in = caption
+
+        # 4) CLIP text features
+        text_tok = clip.tokenize(caption_in, truncate=True).cuda()
+        feat_clip_text, word_emb = clip_model(text_tok)
+
+        # 5) forward（注意与训练一致要 [:,1:]）
+        logits = trans_encoder(
+            masked_input_indices,
+            feat_clip_text,
+            src_mask=seq_mask,
+            att_txt=None,
+            word_emb=word_emb
+        )[:, 1:]   # (B, max_len, vocab)
+
+        # 6) weighted CE（与训练一致）
+        denom = seq_mask_no_end.sum(-1).clamp(min=1).unsqueeze(-1) * bs
+        weights = seq_mask_no_end.float() / denom  # (B, L)
+
+        logits_valid = logits[seq_mask_no_end, :].view(-1, logits.shape[-1])  # (N, V)
+        target_valid = m_tokens[seq_mask_no_end]                               # (N,)
+        w_valid = weights[seq_mask_no_end]                                     # (N,)
+
+        ce = F.cross_entropy(logits_valid, target_valid, reduction='none')     # (N,)
+        loss_batch = (ce * w_valid).sum()
+
+        total_loss += loss_batch.item()
+        total_weight += w_valid.sum().item()   # 理论上每个 batch ≈ 1
+
+    avg_loss = total_loss / max(total_weight, 1e-9)
+
+    trans_encoder.train()
+    return avg_loss
+
+@torch.no_grad()
+def encode_val_motion_to_tokens(motion, m_length, net, args):
+    """
+    motion: (B, T_pad, D) torch.float (val loader输出的 motion)
+    m_length: (B,) torch.long/int (真实帧长)
+    return:
+      m_tokens: (B, max_tok_len) torch.long  [内容tokens + END + PAD]
+      m_tokens_len: (B,) torch.long         [内容tokens长度，不含END/PAD]
+    """
+    device = motion.device
+    B = motion.shape[0]
+
+    # 训练集 token 序列的最大长度：和 dataset_TM_train 里的逻辑对齐
+    unit_length = 2 ** args.down_t
+    max_tok_len = 26 if unit_length == 8 else 50   # 这就是你 training dataset 里那句
+
+    end_id = args.nb_code          # mot_end_idx = codebook_size
+    pad_id = args.nb_code + 1      # mot_pad_idx = codebook_size + 1
+
+    # 先全部填 PAD
+    m_tokens = torch.full((B, max_tok_len), pad_id, dtype=torch.long, device=device)
+    m_tokens_len = torch.zeros((B,), dtype=torch.long, device=device)
+
+    for i in range(B):
+        L = int(m_length[i].item())
+        # 截掉 padding 的 0 帧，不然 encode 会把 padding 当成真实动作
+        x = motion[i, :L]  # (L, D)
+
+        # VQ-VAE encode：不同实现可能吃 (B,T,D) 或 (B,D,T)，这里做个兼容
+        x1 = x.unsqueeze(0).float()  # (1, L, D)
+        try:
+            codes = net(x1, type='encode')
+        except Exception:
+            # fallback: (1, D, L)
+            codes = net(x1.permute(0, 2, 1), type='encode')
+
+        # codes 可能是 (1, T) / (1, T, 1) / (T,) 等形式，统一摊平
+        if torch.is_tensor(codes):
+            codes = codes.detach()
+        codes = codes.reshape(-1).long()  # (T,)
+
+        # 内容 token 长度（要留 1 个位置放 END）
+        tok_len = min(int(codes.numel()), max_tok_len - 1)
+        tok_len = max(tok_len, 1)  # 防止极端情况下为0导致后面权重除0
+
+        m_tokens_len[i] = tok_len
+        m_tokens[i, :tok_len] = codes[:tok_len]
+        m_tokens[i, tok_len] = end_id  # append END
+        # 后面剩下的已经是 PAD
+
+    return m_tokens, m_tokens_len
+
 
 # while nb_iter <= args.total_iter:
 for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
@@ -257,7 +394,14 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
             num_repeat = -30
             rand_pos = True
             val_loader = dataset_TM_eval.DATALoader(args.dataname, True, 32, w_vectorizer)
-        pred_pose_eval, pose, m_length, clip_text, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, best_multi, writer, logger = eval_trans.evaluation_transformer(
+
+        # === 额外计算并记录 eval loss（nomask / mask_text / mask_motion）===
+        for variant in ["nomask", "mask_text", "mask_motion"]:
+            eval_loss = compute_eval_loss_mmm(val_loader, variant, args, net, trans_encoder, clip_model)
+            writer.add_scalar(f'./Eval_Loss/{variant}/motion', eval_loss, nb_iter)
+            logger.info(f"EvalLoss[{variant}] (iter {nb_iter}): {eval_loss:.4f}")
+
+        pred_pose_eval, pose, m_length, clip_text, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, best_multi, writer, logger = eval_trans.evaluation_transformer_old(
             args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter, best_fid, best_iter, best_div,
             best_top1, best_top2, best_top3, best_matching, clip_model=clip_model, eval_wrapper=eval_wrapper,
             dataname=args.dataname, num_repeat=num_repeat, rand_pos=rand_pos)
