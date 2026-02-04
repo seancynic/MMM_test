@@ -78,7 +78,7 @@ net.to(device)
 net.eval()
 
 ##### ---- Text2Motion Transformer ---- #####
-trans_encoder = trans.Text2Motion_Transformer(vqvae=net,
+trans_encoder = trans.Text2Motion_Transformer_New(vqvae=net,
                                               num_vq=args.nb_code,
                                               embed_dim=args.embed_dim_gpt,
                                               block_size=args.block_size,
@@ -104,7 +104,7 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_s
 codebooks = {'train': codebook_train_dir, 'val': codebook_val_dir, 'test': codebook_test_dir}
 for type, codebook_dir in codebooks.items():
     if len(os.listdir(codebook_dir)) == 0:
-        dataloader_token = dataset_tokenize.DATALoader(args.dataname, type=type, batch_size=1,
+        dataloader_token = dataset_tokenize.DATALoaderNew(args.dataname, type=type, batch_size=1,
                                                        unit_length=2 ** args.down_t)
         for batch in dataloader_token:
             pose, name = batch
@@ -114,7 +114,7 @@ for type, codebook_dir in codebooks.items():
             np.save(os.path.join(codebook_dir, f'{name[0]}.npy'), target)
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_TM_train.DATALoader(args.dataname, codebook_train_dir, args.nb_code, args.batch_size,
+train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, args.nb_code, args.batch_size,
                                            unit_length=2 ** args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
 
@@ -148,7 +148,6 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
             seq_mask = generate_src_mask(max_len, seq_lens + 1)
             return ids, seq_mask_no_end, seq_mask, torch.zeros_like(ids, dtype=torch.bool)
 
-
     if max_len == args.max_t:
         seq_mask_no_end[:, 0] = False  # exclude [CLS] token for text
         mask = torch.logical_or(mask, ~seq_mask_no_end).int()
@@ -179,7 +178,7 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
 
 def construct_pred_and_label(pred, ids, seq_mask_no_end):
     weights = seq_mask_no_end / (
-                seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])  # weights[i, j] = 1 / (num_valid * B)
+            seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])  # weights[i, j] = 1 / (num_valid * B)
     pred_seq_masked = pred[seq_mask_no_end, :].view(-1, pred.shape[-1])  # (num_valid, vocab)
     target_seq_masked = ids[seq_mask_no_end]  # (num_valid,)
     weight_seq_masked = weights[seq_mask_no_end]  # (num_valid,)
@@ -194,6 +193,7 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
     right_seq_masked = (pred_seq_masked_index == target_seq_masked).sum()  # compare with label
 
     return right_seq_masked
+
 
 def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     """
@@ -212,15 +212,15 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     target = target.long()
 
     # -------- 1) flatten --------
-    pred_flat = pred.reshape(-1, V)            # (B*L, V)
-    target_flat = target.reshape(-1)           # (B*L,)
-    valid_flat = valid_mask.reshape(-1)        # (B*L,) bool
-    masked_flat = masked_mask.reshape(-1)      # (B*L,) bool
+    pred_flat = pred.reshape(-1, V)  # (B*L, V)
+    target_flat = target.reshape(-1)  # (B*L,)
+    valid_flat = valid_mask.reshape(-1)  # (B*L,) bool
+    masked_flat = masked_mask.reshape(-1)  # (B*L,) bool
 
     # -------- 2) 只取 valid token --------
-    pred_valid = pred_flat[valid_flat]         # (N, V)
-    target_valid = target_flat[valid_flat]     # (N,)
-    masked_valid = masked_flat[valid_flat]     # (N,) 仅在valid里讨论 masked/unmasked
+    pred_valid = pred_flat[valid_flat]  # (N, V)
+    target_valid = target_flat[valid_flat]  # (N,)
+    masked_valid = masked_flat[valid_flat]  # (N,) 仅在valid里讨论 masked/unmasked
 
     # token-wise CE on valid positions only: (N,)
     ce_valid = F.cross_entropy(pred_valid, target_valid, reduction='none')
@@ -228,8 +228,8 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     # -------- 3) 构造权重：每个 valid token 权重 = 1/(num_valid_i * B) --------
     # 先做一个 (B,L) 的 weights，再 flatten 到 valid
     denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1) * B  # (B,1)
-    weights = (valid_mask.float() / denom)                        # (B,L)
-    w_valid = weights.reshape(-1)[valid_flat]                     # (N,)
+    weights = (valid_mask.float() / denom)  # (B,L)
+    w_valid = weights.reshape(-1)[valid_flat]  # (N,)
 
     # -------- 4) 加权求和，并按 masked/unmasked 拆分 --------
     loss_total = (ce_valid * w_valid).sum()
@@ -240,79 +240,6 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     return loss_masked, loss_unmasked, loss_total
 
 
-# @torch.no_grad()
-# def compute_eval_loss(val_loader, first_modality, loss_target='motion'):
-#     trans_encoder.eval()
-#     total_loss_m = total_loss_t = 0.0
-#     total_weight_m = total_weight_t = 0.0
-#
-#     for batch in val_loader:
-#         (_, _, _, m_tokens, _, _, token_ids_t, att_mask_t, _) = batch
-#         m_tokens = m_tokens.to(device)
-#         token_ids_t = token_ids_t.to(device)
-#         att_mask_t = att_mask_t.to(device)
-#         bs, max_m = m_tokens.shape[:2]
-#
-#         # motion 序列长度：减去 1 排除 END token
-#         lens_m = (m_tokens != (args.nb_code + 1)).sum(dim=1) - 1
-#         lens_m = torch.clamp(lens_m, min=1)
-#
-#         # 文本长度：排除 [CLS]、[EOS]、[PAD] 三类特殊标记
-#         cls_id = trans_encoder.module.bert.cls_id
-#         eos_id = trans_encoder.module.bert.eos_id
-#         pad_id = trans_encoder.module.bert.pad_id
-#         invalid_ids = torch.tensor([cls_id, eos_id, pad_id], device=token_ids_t.device)
-#         valid_mask_t = ~torch.isin(token_ids_t, invalid_ids)
-#         lens_t = valid_mask_t.sum(dim=1)
-#
-#         # 生成无随机遮盖的掩码
-#         mask_id_m = get_model(net).vqvae.num_code + 2
-#         mask_id_t = tokenizer.mask_token_id
-#         masked_ids_m, seq_mask_no_end_m, seq_mask_m, _ = masking(
-#             m_tokens, lens_m, bs, max_m, mask_id_m, probs=(0, 0)
-#         )
-#         masked_ids_t, seq_mask_no_end_t, _ = masking(
-#             token_ids_t, lens_t, bs, args.max_t, mask_id_t, probs=(0, 0)
-#         )
-#
-#         # 构造组合 mask 并前向
-#         src_mask = (
-#             torch.cat([seq_mask_m, att_mask_t], dim=1)
-#             if first_modality == "motion"
-#             else torch.cat([att_mask_t, seq_mask_m], dim=1)
-#         )
-#         emb_t = trans_encoder.module.bert(
-#             input_ids=masked_ids_t, attention_mask=att_mask_t
-#         )
-#         pred_m, pred_t = trans_encoder(
-#             masked_ids_m,
-#             src_mask=src_mask,
-#             att_txt=torch.empty(bs, 0, dtype=torch.bool, device=device),
-#             word_emb=emb_t,
-#             first=first_modality,
-#             max_m=max_m,
-#             max_t=args.max_t,
-#         )
-#
-#         # 计算加权交叉熵
-#         pred_seq_m, target_seq_m, weight_seq_m = construct_pred_and_label(
-#             pred_m, m_tokens, seq_mask_no_end_m
-#         )
-#         loss_m = F.cross_entropy(pred_seq_m, target_seq_m, reduction="none")
-#         total_loss_m += (loss_m * weight_seq_m).sum().item()
-#         total_weight_m += weight_seq_m.sum().item()
-#
-#         pred_seq_t, target_seq_t, weight_seq_t = construct_pred_and_label(
-#             pred_t, token_ids_t, seq_mask_no_end_t
-#         )
-#         loss_t = F.cross_entropy(pred_seq_t, target_seq_t, reduction="none")
-#         total_loss_t += (loss_t * weight_seq_t).sum().item()
-#         total_weight_t += weight_seq_t.sum().item()
-#
-#     avg_loss_m = total_loss_m / total_weight_m if total_weight_m > 0 else 0.0
-#     avg_loss_t = total_loss_t / total_weight_t if total_weight_t > 0 else 0.0
-#     trans_encoder.train()
-#     return avg_loss_m, avg_loss_t, avg_loss_m + avg_loss_t
 @torch.no_grad()
 def compute_eval_loss(val_loader, first_modality, variant: str):
     """
@@ -419,6 +346,7 @@ def compute_eval_loss(val_loader, first_modality, variant: str):
     trans_encoder.train()
     return avg_loss_m, avg_loss_t, avg_loss_m + avg_loss_t
 
+
 def train(first_modality, mask_probs):
     # Get masking probabilities
     probs_m, probs_t = mask_probs[0], mask_probs[1]
@@ -519,8 +447,12 @@ def train(first_modality, mask_probs):
             valid_mask=seq_mask_no_end_t,
             masked_mask=mask_token_t
         )
+        # loss_t_masked = 0
+        # loss_t_unmasked = 0
+        # loss_t = 0
 
         loss = loss_m + loss_t
+        # loss = loss_m
 
         # Optimize
         optimizer.zero_grad()
@@ -611,6 +543,7 @@ def train(first_modality, mask_probs):
                              f"BLEU3. {best_bleu3:.4f}, BLEU4. {best_bleu4:.4f}, ROUGE_L. {best_rouge_l:.4f}")
                 logger.info(msg_final)
                 break
+
 
 # Training Step 1: mix training
 bests = train(
