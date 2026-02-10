@@ -176,14 +176,19 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
         return masked_input_indices, seq_mask_no_end, seq_mask, mask_token
 
 
-def construct_pred_and_label(pred, ids, seq_mask_no_end):
-    weights = seq_mask_no_end / (
-            seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])  # weights[i, j] = 1 / (num_valid * B)
+def get_pred_and_label(pred, ids, seq_mask_no_end):
+    # weights[i, j] = 1 / (num_valid * B)
+    weights = seq_mask_no_end / (seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])
     pred_seq_masked = pred[seq_mask_no_end, :].view(-1, pred.shape[-1])  # (num_valid, vocab)
     target_seq_masked = ids[seq_mask_no_end]  # (num_valid,)
-    weight_seq_masked = weights[seq_mask_no_end]  # (num_valid,)
+    weights_seq_masked = weights[seq_mask_no_end]  # (num_valid,)
 
-    return pred_seq_masked, target_seq_masked, weight_seq_masked
+    return pred_seq_masked, target_seq_masked, weights_seq_masked
+
+
+def get_loss(pred_masked, target_masked, weights_masked):
+    loss = F.cross_entropy(pred_masked, target_masked, reduction='none')
+    return (loss * weights_masked).sum()
 
 
 def compute_result(pred_seq_masked, target, seq_mask_no_end):
@@ -326,14 +331,14 @@ def compute_eval_loss(val_loader, first_modality, variant: str):
         )
 
         # ===== loss (same weighting scheme as your training code) =====
-        pred_seq_m, target_seq_m, weight_seq_m = construct_pred_and_label(
+        pred_seq_m, target_seq_m, weight_seq_m = get_pred_and_label(
             pred_m, m_tokens, seq_mask_no_end_m
         )
         loss_m = F.cross_entropy(pred_seq_m, target_seq_m, reduction="none")
         total_loss_m += (loss_m * weight_seq_m).sum().item()
         total_weight_m += weight_seq_m.sum().item()
 
-        pred_seq_t, target_seq_t, weight_seq_t = construct_pred_and_label(
+        pred_seq_t, target_seq_t, weight_seq_t = get_pred_and_label(
             pred_t, token_ids_t, seq_mask_no_end_t
         )
         loss_t = F.cross_entropy(pred_seq_t, target_seq_t, reduction="none")
@@ -423,34 +428,12 @@ def train(first_modality, mask_probs):
                                        max_t=args.max_t)  # (bs, max_m, vocab), (bs, max_t, vocab)
 
         # Compute loss as a batch
-        pred_seq_masked_m, target_seq_masked_m, weight_seq_masked_m = construct_pred_and_label(pred_m, token_ids_m,
-                                                                                               seq_mask_no_end_m)
-        pred_seq_masked_t, target_seq_masked_t, weight_seq_masked_t = construct_pred_and_label(pred_t, token_ids_t,
-                                                                                               seq_mask_no_end_t)
+        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(pred_m, token_ids_m, seq_mask_no_end_m)
+        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(pred_t, token_ids_t, seq_mask_no_end_t)
 
-        # loss_m = F.cross_entropy(pred_seq_masked_m, target_seq_masked_m, reduction='none')
-        # loss_m = (loss_m * weight_seq_masked_m).sum()
-        # loss_t = F.cross_entropy(pred_seq_masked_t, target_seq_masked_t, reduction='none')
-        # loss_t = (loss_t * weight_seq_masked_t).sum()
-
-        loss_m_masked, loss_m_unmasked, loss_m = split_weighted_ce_loss(
-            pred=pred_m,
-            target=token_ids_m,
-            valid_mask=seq_mask_no_end_m,
-            masked_mask=mask_token_m
-        )
-
-        # text: valid=seq_mask_no_end_t, masked=mask_token_t
-        loss_t_masked, loss_t_unmasked, loss_t = split_weighted_ce_loss(
-            pred=pred_t,
-            target=token_ids_t,
-            valid_mask=seq_mask_no_end_t,
-            masked_mask=mask_token_t
-        )
-        # loss_t_masked = 0
-        # loss_t_unmasked = 0
-        # loss_t = 0
-
+        # Compute loss
+        loss_m = get_loss(pred_masked_m, target_masked_m, weights_masked_m)
+        loss_t = get_loss(pred_masked_t, target_masked_t, weights_masked_t)
         loss = loss_m + loss_t
         # loss = loss_m
 
@@ -461,6 +444,21 @@ def train(first_modality, mask_probs):
         scheduler.step()
 
         if nb_iter % args.print_iter == 0:
+            loss_m_masked, loss_m_unmasked, loss_m = split_weighted_ce_loss(
+                pred=pred_m,
+                target=token_ids_m,
+                valid_mask=seq_mask_no_end_m,
+                masked_mask=mask_token_m
+            )
+
+            # text: valid=seq_mask_no_end_t, masked=mask_token_t
+            loss_t_masked, loss_t_unmasked, loss_t = split_weighted_ce_loss(
+                pred=pred_t,
+                target=token_ids_t,
+                valid_mask=seq_mask_no_end_t,
+                masked_mask=mask_token_t
+            )
+
             # [INFO] log loss
             writer.add_scalar('./Loss/motion_masked', loss_m_masked, nb_iter)
             writer.add_scalar('./Loss/motion_unmasked', loss_m_unmasked, nb_iter)
@@ -472,10 +470,10 @@ def train(first_modality, mask_probs):
             writer.add_scalar('./Loss/all', loss, nb_iter)
 
             # [INFO] log accuracy
-            right_seq_masked_m = compute_result(pred_seq_masked_m, token_ids_m, seq_mask_no_end_m)
-            right_seq_masked_t = compute_result(pred_seq_masked_t, token_ids_t, seq_mask_no_end_t)
-            writer.add_scalar('./ACC/every_motion', right_seq_masked_m * 100 / seq_mask_no_end_m.sum(), nb_iter)
-            writer.add_scalar('./ACC/every_text', right_seq_masked_t * 100 / seq_mask_no_end_t.sum(), nb_iter)
+            right_masked_m = compute_result(pred_masked_m, token_ids_m, seq_mask_no_end_m)
+            right_masked_t = compute_result(pred_masked_t, token_ids_t, seq_mask_no_end_t)
+            writer.add_scalar('./ACC/every_motion', right_masked_m * 100 / seq_mask_no_end_m.sum(), nb_iter)
+            writer.add_scalar('./ACC/every_text', right_masked_t * 100 / seq_mask_no_end_t.sum(), nb_iter)
 
             # [INFO] log mask/nomask
             no_mask_token_m = ~mask_token_m * seq_mask_no_end_m
