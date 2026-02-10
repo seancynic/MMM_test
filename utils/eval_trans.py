@@ -793,7 +793,7 @@ def eval_trans_t(out_dir, val_loader, net, trans, logger, writer, nb_iter,
             P, R, F1 = bert_score(pred_text, captions, lang="en",
                                   rescale_with_baseline=True, idf=True,
                                   verbose=False)
-            bert_f1 += F1.mean().item()
+            bert_f1 += F1.sum().item()
 
     bleu1 = bleu1 / nb_sample
     bleu2 = bleu2 / nb_sample
@@ -1340,24 +1340,18 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
     return dist
 
 
-def decode_token_ids(token_ids, tokenizer, pad_token_id, eos_token_id):
-    decoded_texts = []
+def decode_token_ids(token_ids, tokenizer, eos_id):
+    if hasattr(token_ids, 'tolist'):
+        token_ids = token_ids.tolist()
 
-    for ids in token_ids:
-        ids = ids.tolist()
+    batch_tokens = []
+    for row in token_ids:
+        if eos_id in row:
+            batch_tokens.append(row[:row.index(eos_id)])
+        else:
+            batch_tokens.append(row)
 
-        clean_ids = []
-        for t in ids:
-            if t == eos_token_id:
-                break
-            if t == pad_token_id:
-                continue
-            clean_ids.append(t)
-
-        text = tokenizer.decode(clean_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        decoded_texts.append(text.strip())
-
-    return decoded_texts
+    return tokenizer.batch_decode(batch_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
 
 def compute_bleu_scores(preds, refs):

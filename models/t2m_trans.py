@@ -410,6 +410,12 @@ class Text2Motion_Transformer_New(nn.Module):
 
             token_ids_m = torch.where(is_mask, pred_ids_m, token_ids_m)
 
+            # Update score
+            probs_without_temperature = pred_m.softmax(dim=-1)
+            scores = 1 - probs_without_temperature.gather(-1, pred_ids_m[..., None])
+            scores = rearrange(scores, '... 1 -> ...')
+            scores = scores.masked_fill(~is_mask, 0)
+
         return token_ids_m
 
     def sample_t(self, special_ids=None, lens_t=None, token_ids_m=None, seq_mask_m=None,
@@ -493,6 +499,12 @@ class Text2Motion_Transformer_New(nn.Module):
             is_mask = token_ids_t == special_ids['mask_id']
 
             token_ids_t = torch.where(is_mask, pred_ids_t, token_ids_t)
+
+            # Update score
+            probs_without_temperature = pred_t.softmax(dim=-1)
+            scores = 1 - probs_without_temperature.gather(-1, pred_ids_t[..., None])
+            scores = rearrange(scores, '... 1 -> ...')
+            scores = scores.masked_fill(~is_mask, 0)
 
         return token_ids_t
 

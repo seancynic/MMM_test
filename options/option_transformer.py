@@ -36,6 +36,7 @@ def get_args_parser():
 
     ## gpt arch
     parser.add_argument("--max-t", type=int, default=77, help="maximum length of text")
+    parser.add_argument("--max-m", type=int, default=50, help="maximum length of motion")
     parser.add_argument("--block-size", type=int, default=127, help="seq len")
     parser.add_argument("--embed-dim-gpt", type=int, default=1024, help="embedding dimension")
     parser.add_argument("--clip-dim", type=int, default=512, help="latent dimension in the clip feature")
@@ -44,6 +45,7 @@ def get_args_parser():
     parser.add_argument("--n-head-gpt", type=int, default=16, help="nb of heads")
     parser.add_argument("--ff-rate", type=int, default=4, help="feedforward size")
     parser.add_argument("--drop-out-rate", type=float, default=0.1, help="dropout ratio in the pos encoding")
+    parser.add_argument("--first-modality", type=str, default='text', help="first modality")
     
     ## quantizer
     parser.add_argument("--quantizer", type=str, default='ema_reset', choices = ['ema', 'orig', 'ema_reset', 'reset'], help="eps for optimal transport")
