@@ -27,6 +27,8 @@ class MotionEncoder(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, motion_ids, mask=None):
+        key_padding_mask = ~mask.bool() if mask is not None else None
+
         not_learnt_motion_ids = motion_ids < self.vqvae.vqvae.num_code
         learnt_motion_ids = ~not_learnt_motion_ids
 
@@ -35,7 +37,7 @@ class MotionEncoder(nn.Module):
         motion_embeds[learnt_motion_ids] = self.learn_tok_emb(motion_ids[learnt_motion_ids] - self.vqvae.vqvae.num_code)
 
         motion_embeds = self.proj(motion_embeds)  # (batch, max_m, embed_dim)
-        motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=mask)
+        motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=key_padding_mask)
         motion_embeds = self.norm(motion_embeds)  # (batch, max_m, embed_dim)
 
         return motion_embeds
@@ -61,7 +63,9 @@ class MotionDecoder(nn.Module):
         self.proj = nn.Linear(embed_dim, vocab_m)
 
     def forward(self, motion_embeds, mask=None):
-        motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=mask)
+        key_padding_mask = ~mask.bool() if mask is not None else None
+
+        motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=key_padding_mask)
         motion_embeds = self.norm(motion_embeds)  # (batch, max_m, embed_dim)
         motion_logits = self.proj(motion_embeds)  # (batch, max_m, vocab_m)
 
@@ -96,7 +100,9 @@ class TextHead(nn.Module):
     #     self.proj = nn.Linear(self.vqvae.vqvae.code_dim, embed_dim)
     #
     # def forward(self, motion_embeds, mask=None):
-    #     motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=mask)
+    #     key_padding_mask = ~mask.bool() if mask is not None else None
+    #
+    #     motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=key_padding_mask)
     #     motion_embeds = self.norm(motion_embeds)
     #     motion_embeds = self.proj(motion_embeds)
     #
@@ -148,8 +154,8 @@ class BiTMBERT(nn.Module):
             raise ValueError(f"Unknown first modality: {self.fm}")
 
         # Predict text and motion logits
-        text_logits = self.text_head(text_embeds)           # (batch, max_t, vocab_t)
-        motion_logits = self.motion_decoder(motion_embeds)  # (batch, max_m, vocab_m)
+        text_logits = self.text_head(text_embeds)                        # (batch, max_t, vocab_t)
+        motion_logits = self.motion_decoder(motion_embeds, motion_mask)  # (batch, max_m, vocab_m)
 
         return {
             'logits_t': text_logits,
