@@ -520,18 +520,18 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
                 nb_sample += bs
 
     for pred_text, captions, bs in metric_batches:
-        rouge_l += compute_rouge_l(pred_text, captions, scorer=rouge_scorer_obj)
+        rouge_l += compute_rouge_l(pred_text, captions, scorer=rouge_scorer_obj) * bs
         bleu_scores = compute_bleu_scores(pred_text, captions)
-        bleu1 += bleu_scores['BLEU-1']
-        bleu4 += bleu_scores['BLEU-4']
+        bleu1 += bleu_scores['BLEU-1']* bs
+        bleu4 += bleu_scores['BLEU-4']* bs
 
         # compute CIDEr using nlgmetricverse (if available)
         if nlg_evaluator is not None:
             references = [[c] for c in captions]
             # nlg_evaluator returns a dict keyed by metric names
-            _scores = nlg_evaluator(predictions=pred_text, references=references)
+            _scores = nlg_evaluator(predictions=list(pred_text), references=references)
             cider_value = _scores["cider"]["score"]
-            cider_score += cider_value
+            cider_score += cider_value * bs
         # compute BERT F1 using bert_score (if available)
         if bert_score is not None:
             pred_text = list(pred_text)
