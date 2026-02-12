@@ -200,7 +200,7 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
     if max_len == args.max_t:
         return masked_input_indices, seq_mask_no_end, mask_token
     else:
-        seq_mask = generate_src_mask(max_len, seq_lens + 1)
+        seq_mask = generate_src_mask(max_len, seq_lens + 1).to(torch.int64)
         return masked_input_indices, seq_mask_no_end, seq_mask, mask_token
 
 ##### ---- Training ---- #####
