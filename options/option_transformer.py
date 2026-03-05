@@ -1,5 +1,6 @@
 import argparse
 
+
 def get_args_parser():
     parser = argparse.ArgumentParser(description='Optimal Transport AutoEncoder training for Amass',
                                      add_help=True,
@@ -13,12 +14,12 @@ def get_args_parser():
     
     ## optimization
     parser.add_argument('--total-iter', default=300000, type=int, help='number of total iterations to run')
-    parser.add_argument('--warm-up-iter', default=1000, type=int, help='number of total iterations for warmup')
-    parser.add_argument('--lr', default=2e-4, type=float, help='max learning rate')
+    parser.add_argument('--warm-up-iter', default=5000, type=int, help='number of total iterations for warmup')
+    parser.add_argument('--lr', default=5e-5, type=float, help='max learning rate')
     parser.add_argument('--lr-scheduler', default=[150000], nargs="+", type=int, help="learning rate schedule (iterations)")
     parser.add_argument('--gamma', default=0.05, type=float, help="learning rate decay")
     
-    parser.add_argument('--weight-decay', default=1e-6, type=float, help='weight decay') 
+    parser.add_argument('--weight-decay', default=1e-2, type=float, help='weight decay')
     parser.add_argument('--decay-option',default='all', type=str, choices=['all', 'noVQ'], help='disable weight decay on codebook')
     parser.add_argument('--optimizer',default='adamw', type=str, choices=['adam', 'adamw'], help='disable weight decay on codebook')
     
@@ -35,6 +36,7 @@ def get_args_parser():
     parser.add_argument('--vq-act', type=str, default='relu', choices = ['relu', 'silu', 'gelu'], help='dataset directory')
 
     ## gpt arch
+    parser.add_argument("--first-modality", type=str, default='text', help="first modality")
     parser.add_argument("--max-t", type=int, default=77, help="maximum length of text")
     parser.add_argument("--max-m", type=int, default=50, help="maximum length of motion")
     parser.add_argument("--block-size", type=int, default=127, help="seq len")
@@ -45,21 +47,20 @@ def get_args_parser():
     parser.add_argument("--n-head-gpt", type=int, default=16, help="nb of heads")
     parser.add_argument("--ff-rate", type=int, default=4, help="feedforward size")
     parser.add_argument("--drop-out-rate", type=float, default=0.1, help="dropout ratio in the pos encoding")
-    parser.add_argument("--first-modality", type=str, default='text', help="first modality")
     
     ## quantizer
     parser.add_argument("--quantizer", type=str, default='ema_reset', choices = ['ema', 'orig', 'ema_reset', 'reset'], help="eps for optimal transport")
     parser.add_argument('--quantbeta', type=float, default=1.0, help='dataset directory')
 
     ## resume
-    parser.add_argument("--resume-pth", type=str, default=None, help='resume vq pth')
     parser.add_argument("--resume-trans", type=str, default=None, help='resume gpt pth')
     
-    
     ## output directory
+    parser.add_argument('--vq-type', type=str, default='MoMask', help='VQVAE Type')
     parser.add_argument('--out-dir', type=str, default='output', help='output directory')
     parser.add_argument('--exp-name', type=str, default='exp_debug', help='name of the experiment, will create a file inside out-dir')
-    parser.add_argument('--vq-name', type=str, default='retrain', help='name of the generated dataset .npy, will create a file inside out-dir')
+    parser.add_argument('--vq-name', type=str, default='rvqvae', help='name of the generated dataset .npy, will create a file inside out-dir')
+
     ## other
     parser.add_argument('--print-iter', default=200, type=int, help='print frequency')
     parser.add_argument('--eval-iter', default=10000, type=int, help='evaluation frequency')
@@ -71,4 +72,5 @@ def get_args_parser():
     parser.add_argument('--text', type=str, help='text')
     parser.add_argument('--length', type=int, help='length')
 
-    return parser.parse_args()
+    args, _ = parser.parse_known_args()
+    return args

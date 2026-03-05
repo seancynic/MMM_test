@@ -226,7 +226,7 @@ def eval_bitm_t2m(out_dir, val_loader, net, bitm, logger, writer, nb_iter, eval_
 
     for batch in tqdm(val_loader, position=1, leave=True):
         word_embeddings, pos_one_hots, sent_len, _, pose, m_length, token_ids_t, seq_mask_t, _ = batch
-        bs, seq = pose.shape[:2]
+        bs = m_length.shape[0]
         lens_m = torch.ceil(m_length / 4).long()
         pred_len = m_length.cuda()
 
@@ -553,7 +553,6 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
                 rouge_l. {rouge_l:.4f}, \n\
                 cidEr. {cider_score:.4f}, \n\
                 bert_f1. {bert_f1:.4f}"
-
     logger.info(msg)
 
     if draw:
@@ -593,3 +592,147 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
 
     bitm.train()
     return best_iter, best_bleu1, best_bleu4, best_rouge_l, best_cider, best_bert_f1
+
+@torch.no_grad()
+def eval_res_trans(out_dir, val_loader, trans, vq_model, writer, ep, best_fid, best_div,
+                   best_top1, best_top2, best_top3, best_matching, eval_wrapper,
+                   save_ckpt=False, save_anim=False, plot_func=None, cond_scale=2, temperature=1):
+
+    def save(file_name, ep):
+        res_trans_state_dict = trans.state_dict()
+        clip_weights = [e for e in res_trans_state_dict.keys() if e.startswith('clip_model.')]
+        for e in clip_weights:
+            del res_trans_state_dict[e]
+        state = {
+            'res_transformer': res_trans_state_dict,
+            'ep': ep,
+        }
+        torch.save(state, file_name)
+
+    trans.eval()
+    vq_model.eval()
+
+    motion_annotation_list = []
+    motion_pred_list = []
+    R_precision_real = 0
+    R_precision = 0
+    matching_score_real = 0
+    matching_score_pred = 0
+
+    nb_sample = 0
+    for batch in val_loader:
+        word_embeddings, pos_one_hots, sent_len, _, pose, m_length, cond_ids, cond_mask, clip_text = batch
+        # word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token = batch
+        m_length = m_length.cuda().long()
+        pose = pose.cuda().float()
+
+        bs, seq = pose.shape[:2]
+
+        code_indices, all_codes = vq_model.encode(pose)
+        # (b, seqlen)
+        if ep == 0:
+            pred_ids = code_indices[..., 0:1]
+        else:
+            conds = {
+                'cond_ids': cond_ids.cuda(),  # (bs, max_cond)
+                'cond_mask': cond_mask.cuda()  # (bs, max_cond)
+            }
+            pred_ids = trans.generate(code_indices[..., 0], conds, m_length // 4, temperature=temperature, cond_scale=cond_scale)
+
+        pred_motions = vq_model.forward_decoder(pred_ids)
+
+        et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motions.clone(),
+                                                          m_length)
+
+        pose = pose.cuda().float()
+
+        et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
+        motion_annotation_list.append(em)
+        motion_pred_list.append(em_pred)
+
+        temp_R = calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+        temp_match = euclidean_distance_matrix(et.cpu().numpy(), em.cpu().numpy()).trace()
+        R_precision_real += temp_R
+        matching_score_real += temp_match
+        temp_R = calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+        temp_match = euclidean_distance_matrix(et_pred.cpu().numpy(), em_pred.cpu().numpy()).trace()
+        R_precision += temp_R
+        matching_score_pred += temp_match
+
+        nb_sample += bs
+
+    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
+    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+    mu, cov = calculate_activation_statistics(motion_pred_np)
+
+    diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
+    diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
+
+    R_precision_real = R_precision_real / nb_sample
+    R_precision = R_precision / nb_sample
+
+    matching_score_real = matching_score_real / nb_sample
+    matching_score_pred = matching_score_pred / nb_sample
+
+    fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+
+    msg = f"--> \t Eva. Ep {ep} :, \n\
+            FID. {fid:.4f}, \n\
+            Diversity Real. {diversity_real:.4f}, \n\
+            Diversity. {diversity:.4f}, \n\
+            R_precision_real. {R_precision_real}, \n\
+            R_precision. {R_precision}, \n\
+            matching_score_real. {matching_score_real}, \n\
+            matching_score_pred. {matching_score_pred}"
+    print(msg)
+
+    writer.add_scalar('./Test/FID', fid, ep)
+    writer.add_scalar('./Test/Diversity', diversity, ep)
+    writer.add_scalar('./Test/top1', R_precision[0], ep)
+    writer.add_scalar('./Test/top2', R_precision[1], ep)
+    writer.add_scalar('./Test/top3', R_precision[2], ep)
+    writer.add_scalar('./Test/matching_score', matching_score_pred, ep)
+
+    if fid < best_fid:
+        msg = f"--> --> \t FID Improved from {best_fid:.5f} to {fid:.5f} !!!"
+        print(msg)
+        best_fid, best_ep = fid, ep
+        if save_ckpt:
+            save(os.path.join(out_dir, 'model', 'net_best_fid.tar'), ep)
+
+    if matching_score_pred < best_matching:
+        msg = f"--> --> \t matching_score Improved from {best_matching:.5f} to {matching_score_pred:.5f} !!!"
+        print(msg)
+        best_matching = matching_score_pred
+
+    if abs(diversity_real - diversity) < abs(diversity_real - best_div):
+        msg = f"--> --> \t Diversity Improved from {best_div:.5f} to {diversity:.5f} !!!"
+        print(msg)
+        best_div = diversity
+
+    if R_precision[0] > best_top1:
+        msg = f"--> --> \t Top1 Improved from {best_top1:.4f} to {R_precision[0]:.4f} !!!"
+        print(msg)
+        best_top1 = R_precision[0]
+
+    if R_precision[1] > best_top2:
+        msg = f"--> --> \t Top2 Improved from {best_top2:.4f} to {R_precision[1]:.4f} !!!"
+        print(msg)
+        best_top2 = R_precision[1]
+
+    if R_precision[2] > best_top3:
+        msg = f"--> --> \t Top3 Improved from {best_top3:.4f} to {R_precision[2]:.4f} !!!"
+        print(msg)
+        best_top3 = R_precision[2]
+
+    if save_anim:
+        rand_idx = torch.randint(bs, (3,))
+        data = pred_motions[rand_idx].detach().cpu().numpy()
+        captions = [clip_text[k] for k in rand_idx]
+        lengths = m_length[rand_idx].cpu().numpy()
+        save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
+        os.makedirs(save_dir, exist_ok=True)
+        plot_func(data, save_dir, captions, lengths)
+
+    return best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer

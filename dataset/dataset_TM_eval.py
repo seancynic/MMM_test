@@ -16,22 +16,22 @@ def collate_fn(batch):
     return default_collate(batch)
 
 
-'''For use of training text-2-motion generative model'''
+'''For use of evaluating text-2-motion generative model'''
 class Text2MotionDataset(Dataset):
-    def __init__(self, dataset_name, is_test, w_vectorizer, tokenizer_name, codebook_size,
+    def __init__(self, dataset_name, is_test, w_vectorizer, codebook_dir, output_type, codebook_size,
                  max_text_len=20, unit_length=4, shuffle=True, up_low_sep=False):
-        
         self.max_length = 20
         self.pointer = 0
         self.dataset_name = dataset_name
         self.up_low_sep = up_low_sep
+        self.output_type = output_type
 
         self.max_text_len = max_text_len
         self.unit_length = unit_length
         self.w_vectorizer = w_vectorizer
 
         self.mot_end_idx = codebook_size
-        self.mot_pad_idx = codebook_size + 1 # [TODO] I think 513 (codebook_size+1) can be what ever, it will be croped out
+        self.mot_pad_idx = codebook_size + 1  # TODO: I think 513 (codebook_size+1) can be what ever, it will be croped out
         if dataset_name == 't2m':
             self.data_root = './dataset/HumanML3D'
             self.motion_dir = pjoin(self.data_root, 'new_joint_vecs')
@@ -77,11 +77,12 @@ class Text2MotionDataset(Dataset):
         length_list = []
         for name in tqdm(id_list):
             try:
+                if self.output_type == 'motion_ids':
+                    m_token_list = np.load(pjoin(codebook_dir, f'{name}.npy'))
+
                 motion = np.load(pjoin(self.motion_dir, name + '.npy'))
                 if (len(motion)) < min_motion_len or (len(motion) >= 200):
                     continue
-
-                m_token_list = np.load(pjoin(tokenizer_name, f'{name}.npy'))
 
                 text_data = []
                 flag = False
@@ -103,25 +104,33 @@ class Text2MotionDataset(Dataset):
                             text_data.append(text_dict)
                         else:
                             try:
-                                n_motion = motion[int(f_tag*fps) : int(to_tag*fps)]
-                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
-                                    continue
-
-                                # [INFO] Check with KIT, doesn't come here that mean f_tag & to_tag are 0.0 (tag for caption from-to frames)
-                                m_token_list_new = [tokens[int(f_tag * fps / unit_length): int(to_tag * fps / unit_length)] for tokens in
-                                                    m_token_list if int(f_tag * fps / unit_length) < int(to_tag * fps / unit_length)]
-
-                                if len(m_token_list_new) == 0:
-                                    continue
-
                                 new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
                                 while new_name in data_dict:
                                     new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
 
-                                data_dict[new_name] = {'motion': n_motion,
-                                                       'm_token_list': m_token_list_new,
-                                                       'length': len(n_motion),
-                                                       'text':[text_dict]}
+                                if self.output_type == 'motion_ids':
+                                    # [INFO] Check with KIT, doesn't come here that mean f_tag & to_tag are 0.0 (tag for caption from-to frames)
+                                    m_token_list_new = [tokens[int(f_tag * fps / unit_length): int(to_tag * fps / unit_length)]
+                                                        for tokens in m_token_list
+                                                        if int(f_tag * fps / unit_length) < int(to_tag * fps / unit_length)]
+                                    if len(m_token_list_new) == 0:
+                                        continue
+
+                                n_motion = motion[int(f_tag * fps) : int(to_tag * fps)]
+                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
+                                    continue
+
+                                if self.output_type == 'motion_ids':
+                                    data_dict[new_name] = {'m_token_list': m_token_list_new,
+                                                           'motion': n_motion,
+                                                           'length': len(n_motion),
+                                                           'text':[text_dict]}
+                                elif self.output_type == 'motion_vecs':
+                                    data_dict[new_name] = {'motion': n_motion,
+                                                           'length': len(n_motion),
+                                                           'text': [text_dict]}
+                                else:
+                                    raise ValueError(f"Evaluation Dataset Init: the output type {self.output_type} is not supported.")
                                 new_name_list.append(new_name)
                                 length_list.append(len(n_motion))
                             except:
@@ -130,14 +139,20 @@ class Text2MotionDataset(Dataset):
                                 # break
 
                 if flag:
-                    data_dict[name] = {'motion': motion,
-                                       'm_token_list': m_token_list,
-                                       'length': len(motion),
-                                       'text': text_data}
+                    if self.output_type == 'motion_ids':
+                        data_dict[name] = {'m_token_list': m_token_list_new,
+                                               'motion': n_motion,
+                                               'length': len(n_motion),
+                                               'text':[text_dict]}
+                    elif self.output_type == 'motion_vecs':
+                        data_dict[name] = {'motion': n_motion,
+                                               'length': len(n_motion),
+                                               'text': [text_dict]}
+                    else:
+                        raise ValueError(f"Evaluation Dataset Init: the output type {self.output_type} is not supported.")
                     new_name_list.append(name)
                     length_list.append(len(motion))
-            except Exception as e:
-                # print(e)
+            except:
                 pass
 
         name_list, length_list = zip(*sorted(zip(new_name_list, length_list), key=lambda x: x[1]))
@@ -168,13 +183,11 @@ class Text2MotionDataset(Dataset):
         idx = self.pointer + item
         name = self.name_list[idx]
         data = self.data_dict[name]
-        # data = self.data_dict[self.name_list[idx]]
-        m_token_list, motion, m_length, text_list = data['m_token_list'], data['motion'], data['length'], data['text']
-        m_tokens = random.choice(m_token_list)
+        motion, m_length, text_list = data['motion'], data['length'], data['text']
+
         # Randomly select a caption
         text_data = random.choice(text_list)
         caption, tokens = text_data['caption'], text_data['tokens']
-
         if len(tokens) < self.max_text_len:
             # pad with "unk"
             tokens = ['sos/OTHER'] + tokens + ['eos/OTHER']
@@ -193,34 +206,6 @@ class Text2MotionDataset(Dataset):
             word_embeddings.append(word_emb[None, :])
         pos_one_hots = np.concatenate(pos_one_hots, axis=0)
         word_embeddings = np.concatenate(word_embeddings, axis=0)
-
-        # get m_tokens, m_tokens_len
-        coin = np.random.choice([False, False, True])
-        if coin:
-            # drop one token at the head or tail
-            coin2 = np.random.choice([True, False])
-            if coin2:
-                m_tokens = m_tokens[:-1]
-            else:
-                m_tokens = m_tokens[1:]
-        m_tokens_len = m_tokens.shape[0]
-
-        if self.up_low_sep:
-            new_len = random.randint(20, self.max_motion_length - 1)
-            len_mult = math.ceil(new_len / m_tokens_len)
-            m_tokens = np.tile(m_tokens, (len_mult, 1))[:new_len]
-            m_tokens_len = new_len
-            if m_tokens_len + 1 < self.max_motion_length:
-                m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx,
-                                           np.ones((self.max_motion_length - 1 - m_tokens_len, 2), dtype=int) * self.mot_pad_idx], axis=0)
-            else:
-                m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx], axis=0)
-        else:
-            if m_tokens_len + 1 < self.max_motion_length:
-                m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx,
-                                           np.ones((self.max_motion_length - 1 - m_tokens_len), dtype=int) * self.mot_pad_idx], axis=0)
-            else:
-                m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx], axis=0)
 
         # get motion
         if self.unit_length < 10 and self.shuffle:
@@ -241,12 +226,48 @@ class Text2MotionDataset(Dataset):
         if m_length < self.max_frame_length and self.shuffle:
             motion = np.concatenate([motion, np.zeros((self.max_frame_length - m_length, motion.shape[1]))], axis=0)
 
-        return word_embeddings, pos_one_hots, caption, sent_len, m_tokens, motion, m_length, '_'.join(tokens), name
+        if self.output_type == 'motion_ids':
+            m_token_list = data['m_token_list']
+            m_tokens = random.choice(m_token_list)
+
+            # get m_tokens, m_tokens_len
+            coin = np.random.choice([False, False, True])
+            if coin:
+                # drop one token at the head or tail
+                coin2 = np.random.choice([True, False])
+                if coin2:
+                    m_tokens = m_tokens[:-1]
+                else:
+                    m_tokens = m_tokens[1:]
+            m_tokens_len = m_tokens.shape[0]
+
+            if self.up_low_sep:
+                new_len = random.randint(20, self.max_motion_length - 1)
+                len_mult = math.ceil(new_len / m_tokens_len)
+                m_tokens = np.tile(m_tokens, (len_mult, 1))[:new_len]
+                m_tokens_len = new_len
+                if m_tokens_len + 1 < self.max_motion_length:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx,
+                                               np.ones((self.max_motion_length - 1 - m_tokens_len, 2), dtype=int) * self.mot_pad_idx], axis=0)
+                else:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx], axis=0)
+            else:
+                if m_tokens_len + 1 < self.max_motion_length:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx,
+                                               np.ones((self.max_motion_length - 1 - m_tokens_len), dtype=int) * self.mot_pad_idx], axis=0)
+                else:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx], axis=0)
+
+            return word_embeddings, pos_one_hots, caption, sent_len, m_tokens, motion, m_length, '_'.join(tokens), name
+
+        elif self.output_type == 'motion_vecs':
+            return word_embeddings, pos_one_hots, caption, sent_len, 0, motion, m_length, '_'.join(tokens), name
+
+        else:
+            raise ValueError(f"Evaluation Dataset Getitem: the output type {self.output_type} is not supported.")
 
 
-'''For use of training text-2-motion generative model'''
-
-
+'''For use of evaluating text-2-motion generative model'''
 class Text2MotionDataset_old(Dataset):
     def __init__(self, dataset_name, is_test, w_vectorizer, feat_bias=5, max_text_len=20, unit_length=4, shuffle=True):
 
@@ -377,10 +398,7 @@ class Text2MotionDataset_old(Dataset):
         return len(self.data_dict) - self.pointer
 
     def __getitem__(self, item):
-        idx = self.pointer + item
-        name = self.name_list[idx]
-        data = self.data_dict[name]
-        # data = self.data_dict[self.name_list[idx]]
+        data = self.data_dict[self.name_list[self.pointer + item]]
         motion, m_length, text_list = data['motion'], data['length'], data['text']
         # Randomly select a caption
         text_data = random.choice(text_list)
@@ -428,18 +446,6 @@ class Text2MotionDataset_old(Dataset):
         return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens), name
 
 
-
-def DATALoader(dataset_name, is_test, batch_size, w_vectorizer, num_workers=8, unit_length=4, shuffle=True):
-    val_loader = DataLoader(Text2MotionDataset_old(dataset_name, is_test, w_vectorizer, unit_length=unit_length, shuffle=shuffle),
-                            batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn, drop_last=True)
-
-    return val_loader
-
-def cycle(iterable):
-    while True:
-        for x in iterable:
-            yield x
-
 def collate_fn_with_bert(tokenizer_t, max_t):
 
     def collate(batch):
@@ -455,11 +461,23 @@ def collate_fn_with_bert(tokenizer_t, max_t):
 
     return collate
 
-def DATALoaderNew(dataset: str, tokenizer_m: str, w_vectorizer, codebook_size,
+def DATALoaderNew(dataset: str, codebook_dir: str, w_vectorizer, output_type, codebook_size,
                   batch_size=32, is_test=False, tokenizer_t=None, max_t=None, num_w=8, unit_length=4, shuffle=True):
     collate_function = collate_fn_with_bert(tokenizer_t, max_t) if tokenizer_t is not None else collate_fn
 
-    val_loader = DataLoader(Text2MotionDataset(dataset, is_test, w_vectorizer, tokenizer_m, codebook_size, unit_length=unit_length, shuffle=shuffle),
+    val_loader = DataLoader(Text2MotionDataset(dataset, is_test, w_vectorizer, codebook_dir, output_type, codebook_size,
+                                               unit_length=unit_length, shuffle=shuffle),
                             batch_size, shuffle=shuffle, num_workers=num_w, collate_fn=collate_function, drop_last=True)
 
     return val_loader
+
+def DATALoader(dataset_name, is_test, batch_size, w_vectorizer, num_workers=8, unit_length=4, shuffle=True):
+    val_loader = DataLoader(Text2MotionDataset_old(dataset_name, is_test, w_vectorizer, unit_length=unit_length, shuffle=shuffle),
+                            batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate_fn, drop_last=True)
+
+    return val_loader
+
+def cycle(iterable):
+    while True:
+        for x in iterable:
+            yield x

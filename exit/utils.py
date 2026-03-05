@@ -5,13 +5,15 @@ def get_model(model):
 
 import numpy as np
 import torch
-from utils.motion_process import recover_from_ric
 import copy
 import plotly.graph_objects as go
 import shutil
 import datetime
 import os
 import math
+import random
+from einops import rearrange
+from utils.motion_process import recover_from_ric
 
 kit_bone = [[0, 11], [11, 12], [12, 13], [13, 14], [14, 15], [0, 16], [16, 17], [17, 18], [18, 19], [19, 20], [0, 1], [1, 2], [2, 3], [3, 4], [3, 5], [5, 6], [6, 7], [3, 8], [8, 9], [9, 10]]
 t2m_bone = [[0,2], [2,5],[5,8],[8,11],
@@ -232,9 +234,10 @@ def get_range(skeleton, index):
     return [_min, _max], _max-_min
 
 # [INFO] from http://juditacs.github.io/2018/12/27/masked-attention.html
-def generate_src_mask(T, length):
-    B = len(length)
-    mask = torch.arange(T).repeat(B, 1).to(length.device) < length.unsqueeze(-1)
+def generate_src_mask(max_len, lengths):
+    # B = len(length)
+    # mask = torch.arange(T).repeat(B, 1).to(length.device) < length.unsqueeze(-1)
+    mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
     return mask
 
 def copyComplete(source, target):
@@ -267,6 +270,38 @@ def uniform(shape, device = None):
 def cosine_schedule(t):
     return torch.cos(t * math.pi * 0.5)
 
+# More on small value, less on large
+def q_schedule(bs, low, high, device):
+    noise = uniform((bs,), device=device)
+    schedule = 1 - cosine_schedule(noise)
+    return torch.round(schedule * (high - low - 1)).long() + low
+
+def cal_loss(pred, labels, ignore_index=None, smoothing=0.):
+    '''Calculate cross entropy loss, apply label smoothing if needed.'''
+    if smoothing:
+        space = 2
+        n_class = pred.size(1)
+        mask = labels.ne(ignore_index)
+        one_hot = rearrange(F.one_hot(labels, n_class + space), 'a ... b -> a b ...')[:, :n_class]
+        sm_one_hot = one_hot * (1 - smoothing) + (1 - one_hot) * smoothing / (n_class - 1)
+        neg_log_prb = -F.log_softmax(pred, dim=1)
+        loss = (sm_one_hot * neg_log_prb).sum(dim=1)
+        loss = torch.mean(loss.masked_select(mask))
+    else:
+        loss = F.cross_entropy(pred, labels, ignore_index=ignore_index)
+
+    return loss
+
+def cal_performance(pred, labels, ignore_index=None, smoothing=0., tk=1):
+    loss = cal_loss(pred, labels, ignore_index, smoothing=smoothing)
+    pred_id_k = torch.topk(pred, k=tk, dim=1).indices
+    pred_id = pred_id_k[:, 0]
+    mask = labels.ne(ignore_index)
+    n_correct = (pred_id_k == labels.unsqueeze(1)).any(dim=1).masked_select(mask)
+    acc = torch.mean(n_correct.float()).item()
+
+    return loss, pred_id, acc
+
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
@@ -277,12 +312,19 @@ def gumbel_noise(t):
 def gumbel_sample(t, temperature = 1., dim = -1):
     return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim)
 
-def top_k(logits, thres = 0.9):
-    # [INFO] select top 10% samples of last index by fill value to the rest as -inf
-    k = math.ceil((1 - thres) * logits.shape[-1])
-    val, ind = logits.topk(k, dim = -1)
-    probs = torch.full_like(logits, float('-inf'))
-    probs.scatter_(2, ind, val)
+def top_k(logits, thres = 0.9, dim = 0):
+    if dim == -1:
+        k = math.ceil((1 - thres) * logits.shape[dim])
+        val, ind = logits.topk(k, dim=dim)
+        probs = torch.full_like(logits, float('-inf'))
+        probs.scatter_(dim, ind, val)
+    else:
+        # [INFO] select top 10% samples of last index by fill value to the rest as -inf
+        k = math.ceil((1 - thres) * logits.shape[-1])
+        val, ind = logits.topk(k, dim=-1)
+        probs = torch.full_like(logits, float('-inf'))
+        probs.scatter_(2, ind, val)
+
     return probs
 
 # https://github.com/lucidrains/DALLE-pytorch/issues/318
@@ -303,3 +345,18 @@ def top_p(logits, thres = 0.1):
 
     logits[indices_to_remove] = float('-inf')
     return logits
+
+def eval_decorator(fn):
+    def inner(model, *args, **kwargs):
+        was_training = model.training
+        model.eval()
+        out = fn(model, *args, **kwargs)
+        model.train(was_training)
+        return out
+    return inner
+
+def fixseed(seed):
+    torch.backends.cudnn.benchmark = False
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)

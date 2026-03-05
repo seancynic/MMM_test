@@ -45,7 +45,7 @@ def get_args_parser():
     
     
     ## output directory 
-    parser.add_argument('--out-dir', type=str, default='output', help='output directory')
+    parser.add_argument('--out-dir', type=str, default='output/vq', help='output directory')
     parser.add_argument('--results-dir', type=str, default='visual_results/', help='output directory')
     parser.add_argument('--visual-name', type=str, default='baseline', help='output directory')
     parser.add_argument('--exp-name', type=str, default='exp_debug', help='name of the experiment, will create a file inside out-dir')

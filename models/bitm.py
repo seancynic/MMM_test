@@ -4,14 +4,23 @@ from transformers import BertModel
 
 
 class MotionEncoder(nn.Module):
-    def __init__(self, vqvae, embed_dim, num_layers=2, num_heads=4, mlp_ratio=2, dropout=0.1):
+    def __init__(self, vq_model, vq_type, special_ids_m, embed_dim, dropout=0.1, num_layers=2, num_heads=4, mlp_ratio=2):
         super().__init__()
         # VQVAE for motion encoding
-        self.vqvae = vqvae
-        self.learn_tok_emb = nn.Embedding(3, self.vqvae.vqvae.code_dim)  # 3 = [end_id, blank_id, mask_id]
+        self.vq_model = vq_model
+        self.vq_model.eval()
+        for param in self.vq_model.parameters():
+            param.requires_grad = False
 
-        # Projection
-        self.proj = nn.Linear(self.vqvae.vqvae.code_dim, embed_dim)
+        self.vq_type = vq_type
+        if self.vq_type == 'MMM':
+            self.learn_tok_emb = nn.Embedding(len(special_ids_m), self.vq_model.vqvae.code_dim)  # 3 = [end_id, pad_id, mask_id]
+            self.proj = nn.Linear(self.vq_model.vqvae.code_dim, embed_dim)
+        elif self.vq_type == 'MoMask':
+            self.learn_tok_emb = nn.Embedding(len(special_ids_m) + self.vq_model.num_code, self.vq_model.code_dim)
+            self.proj = nn.Linear(self.vq_model.code_dim, embed_dim)
+        else:
+            raise ValueError(f"Main: The vq model {self.vq_type} is not supported.")
 
         # Encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -23,28 +32,30 @@ class MotionEncoder(nn.Module):
             batch_first=True,
             norm_first=True,   # Pre-LayerNorm
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, norm=nn.LayerNorm(embed_dim))
 
     def forward(self, motion_ids, mask=None):
         key_padding_mask = ~mask.bool() if mask is not None else None
 
-        not_learnt_motion_ids = motion_ids < self.vqvae.vqvae.num_code
-        learnt_motion_ids = ~not_learnt_motion_ids
-
-        motion_embeds = torch.empty((*motion_ids.shape, self.vqvae.vqvae.code_dim), device=motion_ids.device)
-        motion_embeds[not_learnt_motion_ids] = self.vqvae.vqvae.quantizer.dequantize(motion_ids[not_learnt_motion_ids]).requires_grad_(False)
-        motion_embeds[learnt_motion_ids] = self.learn_tok_emb(motion_ids[learnt_motion_ids] - self.vqvae.vqvae.num_code)
+        if self.vq_type == 'MMM':
+            fixed_motion_ids = motion_ids < self.vq_model.vqvae.num_code  # (batch, t1)
+            learnt_motion_ids = ~fixed_motion_ids                         # (batch, t2)
+            motion_embeds = torch.empty((*motion_ids.shape, self.vq_model.vqvae.code_dim), device=motion_ids.device)  # (batch, max_m, code_dim)
+            motion_embeds[fixed_motion_ids] = self.vq_model.vqvae.quantizer.dequantize(motion_ids[fixed_motion_ids]).requires_grad_(False)
+            motion_embeds[learnt_motion_ids] = self.learn_tok_emb(motion_ids[learnt_motion_ids] - self.vq_model.vqvae.num_code)
+        elif self.vq_type == 'MoMask':
+            motion_embeds = self.learn_tok_emb(motion_ids)  # (batch, max_m, code_dim)
+        else:
+            raise ValueError(f"Main: The vq model {self.vq_type} is not supported.")
 
         motion_embeds = self.proj(motion_embeds)  # (batch, max_m, embed_dim)
         motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=key_padding_mask)
-        motion_embeds = self.norm(motion_embeds)  # (batch, max_m, embed_dim)
 
         return motion_embeds
 
 
 class MotionDecoder(nn.Module):
-    def __init__(self, vocab_m, embed_dim, num_layers=2, num_heads=4, mlp_ratio=2, dropout=0.1):
+    def __init__(self, vocab_m, embed_dim, dropout=0.1, num_layers=2, num_heads=4, mlp_ratio=2):
         super().__init__()
         # Decoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -56,16 +67,16 @@ class MotionDecoder(nn.Module):
             batch_first=True,
             norm_first=True,   # Pre-LayerNorm
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.decoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(embed_dim)
 
-        # Projection
+        # Projection layer
         self.proj = nn.Linear(embed_dim, vocab_m)
 
     def forward(self, motion_embeds, mask=None):
         key_padding_mask = ~mask.bool() if mask is not None else None
 
-        motion_embeds = self.encoder(motion_embeds, src_key_padding_mask=key_padding_mask)
+        motion_embeds = self.decoder(motion_embeds, src_key_padding_mask=key_padding_mask)
         motion_embeds = self.norm(motion_embeds)  # (batch, max_m, embed_dim)
         motion_logits = self.proj(motion_embeds)  # (batch, max_m, vocab_m)
 
@@ -97,7 +108,7 @@ class TextHead(nn.Module):
     #     self.norm = nn.LayerNorm(embed_dim)
     #
     #     # Projection
-    #     self.proj = nn.Linear(self.vqvae.vqvae.code_dim, embed_dim)
+    #     self.proj = nn.Linear(self.vq_model.vqvae.code_dim, embed_dim)
     #
     # def forward(self, motion_embeds, mask=None):
     #     key_padding_mask = ~mask.bool() if mask is not None else None
@@ -110,19 +121,22 @@ class TextHead(nn.Module):
 
 
 class BiTMBERT(nn.Module):
-    def __init__(self, bert_name, vqvae, vocab_m, max_t, max_m, first_modality, dropout_rate):
+    def __init__(self, bert_name, vq_model, vq_type, vocab_m, special_ids_m, max_t, max_m, first_modality, dropout_rate):
         super().__init__()
-        # Backbone
-        self.bert = BertModel.from_pretrained(bert_name)
-        # Text Head
-        self.text_head = TextHead(self.bert.config.hidden_size, self.bert.config.vocab_size)
-        # Motion Encoder and Decoder
-        self.motion_encoder = MotionEncoder(vqvae, self.bert.config.hidden_size, dropout=dropout_rate)
-        self.motion_decoder = MotionDecoder(vocab_m, self.bert.config.hidden_size, dropout=dropout_rate)
-
         self.max_t = max_t
         self.max_m = max_m
         self.fm = first_modality
+
+        # Backbone
+        self.bert = BertModel.from_pretrained(bert_name)
+        self.embed_dim = self.bert.config.hidden_size
+
+        # Text Head
+        self.text_head = TextHead(self.embed_dim, self.bert.config.vocab_size)
+
+        # Motion Encoder and Decoder
+        self.motion_encoder = MotionEncoder(vq_model, vq_type, special_ids_m, self.embed_dim, dropout_rate)
+        self.motion_decoder = MotionDecoder(vocab_m, self.embed_dim, dropout_rate)
 
     def forward(self, text_ids, motion_ids, text_mask, motion_mask):
         # Get text and motion embeddings
@@ -154,10 +168,10 @@ class BiTMBERT(nn.Module):
             raise ValueError(f"Unknown first modality: {self.fm}")
 
         # Predict text and motion logits
-        text_logits = self.text_head(text_embeds)                        # (batch, max_t, vocab_t)
-        motion_logits = self.motion_decoder(motion_embeds, motion_mask)  # (batch, max_m, vocab_m)
+        text_logits = self.text_head(text_embeds)
+        motion_logits = self.motion_decoder(motion_embeds, motion_mask)
 
         return {
-            'logits_t': text_logits,
-            'logits_m': motion_logits,
+            'logits_t': text_logits,    # (batch, max_t, vocab_t)
+            'logits_m': motion_logits,  # (batch, max_m, vocab_m)
         }

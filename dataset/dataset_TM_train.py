@@ -16,17 +16,17 @@ def collate_fn(batch):
 
 '''For use of training text-2-motion generative model'''
 class Text2MotionDataset(Dataset):
-    def __init__(self, dataset_name, tokenizer_name, codebook_size, unit_length=4, up_low_sep=False):
-        
+    def __init__(self, dataset_name, codebook_dir, output_type, codebook_size, unit_length=4, up_low_sep=False):
         self.max_length = 64
         self.pointer = 0
         self.dataset_name = dataset_name
         self.up_low_sep = up_low_sep
+        self.output_type = output_type
 
         self.unit_length = unit_length
         # self.mot_start_idx = codebook_size
         self.mot_end_idx = codebook_size
-        self.mot_pad_idx = codebook_size + 1 # [TODO] I think 513 (codebook_size+1) can be what ever, it will be croped out
+        self.mot_pad_idx = codebook_size + 1  # TODO: I think 513 (codebook_size+1) can be what ever, it will be croped out
         if dataset_name == 't2m':
             self.data_root = './dataset/HumanML3D'
             self.motion_dir = pjoin(self.data_root, 'new_joint_vecs')
@@ -50,6 +50,8 @@ class Text2MotionDataset(Dataset):
 
         split_file = pjoin(self.data_root, 'train.txt')
 
+        min_motion_len = 40 if self.dataset_name =='t2m' else 24
+
         id_list = []
         with cs.open(split_file, 'r') as f:
             for line in f.readlines():
@@ -59,7 +61,14 @@ class Text2MotionDataset(Dataset):
         data_dict = {}
         for name in tqdm(id_list):
             try:
-                m_token_list = np.load(pjoin(tokenizer_name, f'{name}.npy'))
+                if self.output_type == 'motion_ids':
+                    m_token_list = np.load(pjoin(codebook_dir, f'{name}.npy'))
+                elif self.output_type == 'motion_vecs':
+                    motion = np.load(pjoin(self.motion_dir, name + '.npy'))
+                    if (len(motion)) < min_motion_len or (len(motion) >= 200):
+                        continue
+                else:
+                    raise ValueError(f"Training Dataset Init: the output type {self.output_type} is not supported.")
 
                 # Read text
                 with cs.open(pjoin(self.text_dir, name + '.txt')) as f:
@@ -84,23 +93,43 @@ class Text2MotionDataset(Dataset):
                                 flag = True
                                 text_data.append(text_dict)
                             else:
-                                # [INFO] Check with KIT, doesn't come here that mean f_tag & to_tag are 0.0 (tag for caption from-to frames)
-                                m_token_list_new = [tokens[int(f_tag * fps / unit_length):int(to_tag * fps / unit_length)]
-                                                    for tokens in m_token_list if int(f_tag * fps / unit_length) < int(to_tag * fps / unit_length)]
-                                if len(m_token_list_new) == 0:
-                                    continue
-
                                 new_name = f'{name}_{f_tag}_{to_tag}'
 
-                                data_dict[new_name] = {'m_token_list': m_token_list_new,
-                                                       'text':[text_dict]}
+                                if self.output_type == 'motion_ids':
+                                    # [INFO] Check with KIT, doesn't come here that mean f_tag & to_tag are 0.0 (tag for caption from-to frames)
+                                    m_token_list_new = [tokens[int(f_tag * fps / unit_length):int(to_tag * fps / unit_length)]
+                                                        for tokens in m_token_list
+                                                        if int(f_tag * fps / unit_length) < int(to_tag * fps / unit_length)]
+                                    if len(m_token_list_new) == 0:
+                                        continue
+                                    data_dict[new_name] = {'m_token_list': m_token_list_new,
+                                                           'text': [text_dict]}
+
+                                elif self.output_type == 'motion_vecs':
+                                    n_motion = motion[int(f_tag * fps) : int(to_tag * fps)]
+                                    if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
+                                        continue
+                                    data_dict[new_name] = {'motion': n_motion,
+                                                           'length': len(n_motion),
+                                                           'text': [text_dict]}
+
+                                else:
+                                    raise ValueError(f"Training Dataset Init: the output type {self.output_type} is not supported.")
+
                                 new_name_list.append(new_name)
                         except:
                             pass
 
                 if flag:
-                    data_dict[name] = {'m_token_list': m_token_list,
-                                       'text':text_data}
+                    if self.output_type == 'motion_ids':
+                        data_dict[name] = {'m_token_list': m_token_list_new,
+                                               'text': [text_dict]}
+                    elif self.output_type == 'motion_vecs':
+                        data_dict[name] = {'motion': n_motion,
+                                               'length': len(n_motion),
+                                               'text': [text_dict]}
+                    else:
+                        raise ValueError(f"Training Dataset Init: the output type {self.output_type} is not supported.")
                     new_name_list.append(name)
             except:
                 pass
@@ -111,44 +140,75 @@ class Text2MotionDataset(Dataset):
         return len(self.data_dict)
 
     def __getitem__(self, item):
-        data = self.data_dict[self.name_list[item]]
-        m_token_list, text_list = data['m_token_list'], data['text']
-        m_tokens = random.choice(m_token_list)
+        name = self.name_list[item]
+        data = self.data_dict[name]
+        if self.output_type == 'motion_ids':
+            m_token_list, text_list = data['m_token_list'], data['text']
+            m_tokens = random.choice(m_token_list)  # (T,)
+            text_data = random.choice(text_list)
+            caption = text_data['caption']
 
-        text_data = random.choice(text_list)
-        caption = text_data['caption']
-        
-        coin = np.random.choice([False, False, True])
-        if coin:
-            # drop one token at the head or tail
-            coin2 = np.random.choice([True, False])
-            if coin2:
-                m_tokens = m_tokens[:-1]
-            else:
-                m_tokens = m_tokens[1:]
-        m_tokens_len = m_tokens.shape[0]
+            coin = np.random.choice([False, False, True])
+            if coin:
+                # drop one token at the head or tail
+                coin2 = np.random.choice([True, False])
+                if coin2:
+                    m_tokens = m_tokens[:-1]
+                else:
+                    m_tokens = m_tokens[1:]
+            m_tokens_len = m_tokens.shape[0]
 
-        if self.up_low_sep:
-            new_len = random.randint(20, self.max_motion_length-1)
-            len_mult = math.ceil(new_len/m_tokens_len)
-            m_tokens = np.tile(m_tokens, (len_mult, 1))[:new_len]
-            m_tokens_len = new_len
-            if m_tokens_len+1 < self.max_motion_length:
-                m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx, np.ones((self.max_motion_length-1-m_tokens_len, 2), dtype=int) * self.mot_pad_idx], axis=0)
+            if self.up_low_sep:
+                new_len = random.randint(20, self.max_motion_length - 1)
+                len_mult = math.ceil(new_len / m_tokens_len)
+                m_tokens = np.tile(m_tokens, (len_mult, 1))[:new_len]
+                m_tokens_len = new_len
+                if m_tokens_len + 1 < self.max_motion_length:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx,
+                                               np.ones((self.max_motion_length - 1 - m_tokens_len, 2), dtype=int) * self.mot_pad_idx], axis=0)
+                else:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx], axis=0)
+
             else:
-                m_tokens = np.concatenate([m_tokens, np.ones((1, 2), dtype=int) * self.mot_end_idx], axis=0)
+                if m_tokens_len + 1 < self.max_motion_length:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx,
+                                               np.ones((self.max_motion_length - 1 - m_tokens_len), dtype=int) * self.mot_pad_idx], axis=0)
+                else:
+                    m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx], axis=0)
+
+            return caption, m_tokens, m_tokens_len
+
+        elif self.output_type == 'motion_vecs':
+            motion, m_length, text_list = data['motion'], data['length'], data['text']
+            text_data = random.choice(text_list)
+            caption = text_data['caption']
+
+            # get motion
+            if self.unit_length < 10 and self.shuffle:
+                coin3 = np.random.choice(['single', 'single', 'double'])
+            else:
+                coin3 = 'single'
+
+            if coin3 == 'double':
+                m_length = (m_length // self.unit_length - 1) * self.unit_length
+            elif coin3 == 'single':
+                m_length = (m_length // self.unit_length) * self.unit_length
+            idx = random.randint(0, len(motion) - m_length)
+            motion = motion[idx:idx + m_length]
+
+            "Z Normalization"
+            motion = (motion - self.mean) / self.std
+
+            if m_length < self.max_frame_length and self.shuffle:
+                motion = np.concatenate([motion, np.zeros((self.max_frame_length - m_length, motion.shape[1]))], axis=0)
+
+            return caption, motion, m_length
+
         else:
-            if m_tokens_len+1 < self.max_motion_length:
-                m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx, np.ones((self.max_motion_length-1-m_tokens_len), dtype=int) * self.mot_pad_idx], axis=0)
-            else:
-                m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx], axis=0)
-
-        return caption, m_tokens, m_tokens_len
+            raise ValueError(f"Training Dataset Getitem: the output type {self.output_type} is not supported.")
 
 
 '''For use of training text-2-motion generative model'''
-
-
 class Text2MotionDataset_old(Dataset):
     def __init__(self, dataset_name, feat_bias=5, unit_length=4, codebook_size=1024, tokenizer_name=None,
                  up_low_sep=False):
@@ -286,23 +346,18 @@ class Text2MotionDataset_old(Dataset):
         return caption, m_tokens, m_tokens_len
 
 
-def DATALoader(dataset_name,
-               batch_size, codebook_size, tokenizer_name, unit_length=4,
-               num_workers=8, up_low_sep=False):
-    train_loader = DataLoader(
-        Text2MotionDataset_old(dataset_name, codebook_size=codebook_size, tokenizer_name=tokenizer_name,
-                           unit_length=unit_length, up_low_sep=up_low_sep),
-        batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        # collate_fn=collate_fn,
-        drop_last=True)
+def DATALoaderNew(dataset_name, codebook_dir, output_type, codebook_size, batch_size, unit_length):
+    train_loader = DataLoader(Text2MotionDataset(dataset_name, codebook_dir, output_type, codebook_size, unit_length),
+                              batch_size, shuffle=True, num_workers=8, drop_last=True)
 
     return train_loader
 
-def DATALoaderNew(dataset_name, tokenizer_name, codebook_size, batch_size, unit_length=4, num_workers=8, up_low_sep=False):
-    train_loader = DataLoader(Text2MotionDataset(dataset_name, tokenizer_name, codebook_size, unit_length=unit_length, up_low_sep=up_low_sep),
-                              batch_size, shuffle=True, num_workers=num_workers, drop_last = True)
+def DATALoader(dataset_name,
+               batch_size, codebook_size, tokenizer_name, unit_length=4,
+               num_workers=8, up_low_sep=False):
+    train_loader = DataLoader(Text2MotionDataset_old(dataset_name, codebook_size=codebook_size, tokenizer_name=tokenizer_name,
+                                                     unit_length=unit_length, up_low_sep=up_low_sep),
+                              batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
 
     return train_loader
 
