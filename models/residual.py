@@ -13,7 +13,7 @@ from os.path import join as pjoin
 
 from exit.utils import generate_src_mask, q_schedule, cal_performance, gumbel_sample, top_k, eval_decorator
 from utils.losses import print_current_loss
-from utils.eval_bitm import eval_res_trans
+from utils.eval_bitm_res import eval_res_trans
 
 
 def def_value():

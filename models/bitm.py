@@ -121,7 +121,7 @@ class TextHead(nn.Module):
 
 
 class BiTMBERT(nn.Module):
-    def __init__(self, bert_name, vq_model, vq_type, vocab_m, special_ids_m, max_t, max_m, first_modality, dropout_rate):
+    def __init__(self, bert_name, vq_model, vq_type, special_ids_m, max_t, max_m, first_modality, dropout_rate):
         super().__init__()
         self.max_t = max_t
         self.max_m = max_m
@@ -136,7 +136,7 @@ class BiTMBERT(nn.Module):
 
         # Motion Encoder and Decoder
         self.motion_encoder = MotionEncoder(vq_model, vq_type, special_ids_m, self.embed_dim, dropout_rate)
-        self.motion_decoder = MotionDecoder(vocab_m, self.embed_dim, dropout_rate)
+        self.motion_decoder = MotionDecoder(vq_model.num_code, self.embed_dim, dropout_rate)
 
     def forward(self, text_ids, motion_ids, text_mask, motion_mask):
         # Get text and motion embeddings
@@ -159,8 +159,8 @@ class BiTMBERT(nn.Module):
 
         # Separate text and motion embeddings
         if self.fm == 'motion':
-            text_embeds = embeds[:, self.max_m:]    # (batch, max_t, hidden_size)
             motion_embeds = embeds[:, :self.max_m]  # (batch, max_m, hidden_size)
+            text_embeds = embeds[:, self.max_m:]    # (batch, max_t, hidden_size)
         elif self.fm == 'text':
             text_embeds = embeds[:, :self.max_t]    # (batch, max_t, hidden_size)
             motion_embeds = embeds[:, self.max_t:]  # (batch, max_m, hidden_size)

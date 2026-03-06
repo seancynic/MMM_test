@@ -140,14 +140,14 @@ class Text2MotionDataset(Dataset):
 
                 if flag:
                     if self.output_type == 'motion_ids':
-                        data_dict[name] = {'m_token_list': m_token_list_new,
-                                               'motion': n_motion,
-                                               'length': len(n_motion),
-                                               'text':[text_dict]}
+                        data_dict[name] = {'m_token_list': m_token_list,
+                                           'motion': motion,
+                                           'length': len(motion),
+                                           'text': text_data}
                     elif self.output_type == 'motion_vecs':
-                        data_dict[name] = {'motion': n_motion,
-                                               'length': len(n_motion),
-                                               'text': [text_dict]}
+                        data_dict[name] = {'motion': motion,
+                                           'length': len(motion),
+                                           'text': text_data}
                     else:
                         raise ValueError(f"Evaluation Dataset Init: the output type {self.output_type} is not supported.")
                     new_name_list.append(name)

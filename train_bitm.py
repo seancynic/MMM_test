@@ -21,7 +21,7 @@ from models.vq.model import RVQVAE
 from models.bitm import BiTMBERT
 
 from utils.utils_model import get_logger, initial_optim
-from utils.eval_bitm import eval_bitm_t2m, eval_bitm_m2t
+from utils.eval_bitm_res import eval_bitm_t2m, eval_bitm_m2t
 from exit.utils import get_model, generate_src_mask, init_save_folder, fixseed
 
 
@@ -122,6 +122,7 @@ if args.vq_type == 'MMM':
         'pad_id': args.nb_code + 1,
         'mask_id': args.nb_code + 2,
     }  # Set motion special ids
+    curr_nb_code = args.nb_code
 
 elif args.vq_type == 'MoMask':
     vq_opt = momask_opt()
@@ -145,9 +146,11 @@ elif args.vq_type == 'MoMask':
     net.eval()
 
     special_ids_m = {
-        'mask_id': args.nb_code,
-        'pad_id': args.nb_code + 1,
+        'end_id': vq_opt.nb_code,
+        'pad_id': vq_opt.nb_code + 1,
+        'mask_id': vq_opt.nb_code + 2,
     }  # Set motion special ids
+    curr_nb_code = vq_opt.nb_code
 
 else:
     raise ValueError(f"Main: the VQ model {args.vq_type} is not supported.")
@@ -174,7 +177,6 @@ for type, codebook_dir in codebooks.items():
 bitm_model = BiTMBERT(bert_name=bert_name,
                       vq_model=net,
                       vq_type=args.vq_type,
-                      vocab_m=args.nb_code,
                       special_ids_m=special_ids_m,
                       max_t=args.max_t,
                       max_m=args.max_m,
@@ -187,6 +189,7 @@ if args.resume_trans is not None:
     bitm_model.load_state_dict(ckpt['trans'], strict=True)
 bitm_model.to(device)
 bitm_model.train()
+bitm_model.motion_encoder.vq_model.eval()
 bitm_model = torch.nn.DataParallel(bitm_model)
 
 ##### ---- Optimizer & Scheduler ---- #####
@@ -194,7 +197,7 @@ optimizer = initial_optim(args.decay_option, args.lr, args.weight_decay, bitm_mo
 scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_scheduler, gamma=args.gamma)
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, 'motion_ids', args.nb_code,
+train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, 'motion_ids', curr_nb_code,
                                               batch_size=args.batch_size, unit_length=2 ** args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
 
@@ -239,7 +242,7 @@ def masking(ids, seq_lens, batch_size, max_len, probs: list = None, no_corruptio
     else:
         if no_corruption:
             return ids, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), torch.zeros_like(ids, dtype=torch.bool)
-        r_indices = torch.randint(0, args.nb_code, ids.shape, device=curr_device)
+        r_indices = torch.randint(0, curr_nb_code, ids.shape, device=curr_device)
 
     corrupt_selector = torch.logical_and(~mask, seq_mask_no_end.unsqueeze(-1)) if is_multi_level else torch.logical_and(~mask, seq_mask_no_end)
     input_indices = torch.where(corrupt_selector, r_indices, ids)
@@ -492,12 +495,12 @@ def train(mask_probs, task_prob, split_loss):
                 codebook_dir = codebook_val_dir
                 is_test = False
 
-            data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_dir, w_vectorizer, 'motion_ids', args.nb_code,
+            data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_dir, w_vectorizer, 'motion_ids', curr_nb_code,
                                                         batch_size=32, is_test=is_test, tokenizer_t=tokenizer,
                                                         max_t=args.max_t)
             # T2M Evaluation
             best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
-                args.out_dir, data_loader, net, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, args.max_m,
+                args.out_dir, data_loader, net, args.vq_type, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, args.max_m,
                 best_iter=best_iter_m, best_fid=best_fid, best_div=best_div,
                 best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
                 num_repeat=num_repeat, rand_pos=rand_pos)

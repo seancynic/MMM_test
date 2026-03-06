@@ -18,7 +18,7 @@ from models.vq.model import RVQVAE
 from models.bitm import BiTMBERT
 
 from utils.utils_model import get_logger
-from utils.eval_bitm import eval_bitm_t2m, eval_bitm_m2t
+from utils.eval_bitm_res import eval_bitm_t2m, eval_bitm_m2t
 from exit.utils import init_save_folder, fixseed
 
 
@@ -120,6 +120,7 @@ if args.vq_type == 'MMM':
         'pad_id': args.nb_code + 1,
         'mask_id': args.nb_code + 2,
     }  # Set motion special ids
+    curr_nb_code = args.nb_code
 
 elif args.vq_type == 'MoMask':
     vq_opt = momask_opt()
@@ -143,9 +144,11 @@ elif args.vq_type == 'MoMask':
     net.eval()
 
     special_ids_m = {
-        'mask_id': args.nb_code,
-        'pad_id': args.nb_code + 1,
+        'end_id': vq_opt.nb_code,
+        'pad_id': vq_opt.nb_code + 1,
+        'mask_id': vq_opt.nb_code + 2,
     }  # Set motion special ids
+    curr_nb_code = args.nb_code
 
 else:
     raise ValueError(f"Main: the VQ model {args.vq_type} is not supported.")
@@ -154,7 +157,6 @@ else:
 bitm_model = BiTMBERT(bert_name=bert_name,
                       vq_model=net,
                       vq_type=args.vq_type,
-                      vocab_m=args.nb_code,
                       special_ids_m=special_ids_m,
                       max_t=args.max_t,
                       max_m=args.max_m,
@@ -186,7 +188,7 @@ def eval_only(split='test'):
         codebook_dir = codebook_val_dir
         is_test = False
 
-    data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_dir, w_vectorizer, 'motion_ids', args.nb_code,
+    data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_dir, w_vectorizer, 'motion_ids', curr_nb_code,
                                                 batch_size=32, is_test=is_test, tokenizer_t=tokenizer,
                                                 max_t=args.max_t)
 
@@ -210,7 +212,7 @@ def eval_only(split='test'):
     nb_iter = 0  # for log
 
     best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
-        args.out_dir, data_loader, net, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, args.max_m,
+        args.out_dir, data_loader, net, args.vq_type, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, args.max_m,
         best_iter=best_iter_m, best_fid=best_fid, best_div=best_div,
         best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
         num_repeat=num_repeat, rand_pos=rand_pos)

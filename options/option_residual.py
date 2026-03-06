@@ -11,7 +11,7 @@ class BaseOptions():
         self.parser.add_argument("--max-t", type=int, default=77, help="maximum length of text")
 
         self.parser.add_argument('--name', type=str, default="t2m_nlayer8_nhead6_ld384_ff1024_cdp0.1_rvq6ns", help='Name of this trial')
-        self.parser.add_argument('--vq-name', type=str, default="rvq_nq1_dc512_nc512", help='Name of the rvq model.')
+        self.parser.add_argument('--vq-name', type=str, default="rvq_nq6_dc512_nc512_noshare_qdp0.2", help='Name of the rvq model.')
 
         self.parser.add_argument("--gpu-id", type=int, default=-1, help='GPU id')
         self.parser.add_argument('--dataset-name', type=str, default='t2m', help='Dataset Name, {t2m} for humanml3d, {kit} for kit-ml')

@@ -205,7 +205,7 @@ def inference_t2m(model, lens_m: torch.Tensor, token_ids_t, seq_mask_t, seq_mask
     return token_ids_m
 
 @torch.no_grad()
-def eval_bitm_t2m(out_dir, val_loader, net, bitm, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
+def eval_bitm_t2m(out_dir, val_loader, vq_model, vq_type, bitm, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
                   best_iter=0, best_fid=1000, best_div=100, best_top1=0, best_top2=0, best_top3=0, best_matching=100,
                   draw=True, save=True, num_repeat=1, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
@@ -250,10 +250,18 @@ def eval_bitm_t2m(out_dir, val_loader, net, bitm, logger, writer, nb_iter, eval_
 
             # [INFO] need to run single sample at a time because it's conv
             pred_pose_eval = torch.zeros(pose.shape).cuda()
-            for k in range(bs):
-                # [INFO] Eval by m_length
-                pred_pose = net(index_motion[k:k + 1, :lens_m[k].item()], type='decode')  # (1, m_length, dim_m)
-                pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose  # (bs, m_length, dim_m)
+
+            if vq_type == 'MMM':
+                for k in range(bs):
+                    # [INFO] Eval by pose_length
+                    pred_pose = vq_model(index_motion[k:k + 1, :lens_m[k].item()], type='decode')  # (1, pose_length, dim_pose)
+                    pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose  # (bs, pose_length, dim_pose)
+            elif vq_type == 'MoMask':
+                index_motion.unsqueeze_(-1)
+                for k in range(bs):
+                    # [INFO] Eval by pose_length
+                    pred_pose = vq_model.forward_decoder(index_motion[k:k + 1, :lens_m[k].item()])  # (1, pose_length, dim_pose)
+                    pred_pose_eval[k:k + 1, :pred_len[k].item()] = pred_pose  # (bs, pose_length, dim_pose)
 
             et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
 
