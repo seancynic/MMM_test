@@ -52,6 +52,7 @@ eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
 ##### ---- GloVe ---- #####
 from utils.word_vectorizer import WordVectorizer
+
 w_vectorizer = WordVectorizer('./glove', 'our_vab')
 
 ##### ---- BERT Tokenizer ---- #####
@@ -88,12 +89,12 @@ special_ids_m = {
 
 ##### ---- Text2Motion Transformer ---- #####
 bitm_model = BiTMBERT(bert_name=bert_name,
-                     vqvae=net,
-                     vocab_m=args.nb_code,
-                     max_t=args.max_t,
-                     max_m=args.max_m,
-                     first_modality=args.first_modality,
-                     dropout_rate=args.drop_out_rate)
+                      vqvae=net,
+                      vocab_m=args.nb_code,
+                      max_t=args.max_t,
+                      max_m=args.max_m,
+                      first_modality=args.first_modality,
+                      dropout_rate=args.drop_out_rate)
 
 if args.resume_trans is not None:
     print('loading transformer checkpoint from {}'.format(args.resume_trans))
@@ -111,7 +112,8 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_s
 codebooks = {'train': codebook_train_dir, 'val': codebook_val_dir, 'test': codebook_test_dir}
 for type, codebook_dir in codebooks.items():
     if len(os.listdir(codebook_dir)) == 0:
-        dataloader_token = dataset_tokenize.DATALoaderNew(args.dataname, type=type, batch_size=1, unit_length=2 ** args.down_t)
+        dataloader_token = dataset_tokenize.DATALoaderNew(args.dataname, type=type, batch_size=1,
+                                                          unit_length=2 ** args.down_t)
         for batch in dataloader_token:
             pose, name = batch
             pose = pose.to(device).float()  # bs, nb_joints, joints_dim, seq_len
@@ -120,8 +122,10 @@ for type, codebook_dir in codebooks.items():
             np.save(os.path.join(codebook_dir, f'{name[0]}.npy'), target)
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, args.nb_code, args.batch_size, unit_length=2 ** args.down_t)
+train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, args.nb_code, args.batch_size,
+                                              unit_length=2 ** args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
+
 
 ##### ---- Evaluation ---- #####
 def compute_result(pred_seq_masked, target, seq_mask_no_end):
@@ -130,6 +134,7 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
     right_seq_masked = (pred_seq_masked_index == target_seq_masked).sum()  # compare with label
 
     return right_seq_masked
+
 
 def get_acc(cls_pred, target, mask):
     # Only look at the indices where mask is True
@@ -143,31 +148,28 @@ def get_acc(cls_pred, target, mask):
     correct = (predictions == active_targets).float().sum()
     return (correct / mask.sum()) * 100
 
+
 ##### ---- Masking ---- #####
-def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: list, no_corruption=False):
+def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, probs: list = None, no_corruption: bool = False):
+    curr_device = ids.device
     if args.pkeep == -1:
-        proba = torch.rand(1, device=ids.device)
-        mask = torch.rand(ids.shape, device=ids.device) < proba
+        proba = torch.rand(1, device=curr_device)
+        mask = torch.rand(ids.shape, device=curr_device) < proba
     else:
-        mask = torch.rand(ids.shape, device=ids.device) < args.pkeep
+        mask = torch.rand(ids.shape, device=curr_device) < args.pkeep
 
     # Step 1: Random only real token. To prevent pad token got mixed up.
     seq_mask_no_end = generate_src_mask(max_len, seq_lens)
-
-    if no_corruption:
-        # 不做 Step1 随机替换，也不做 Step2 mask
-        if max_len == args.max_t:
-            seq_mask_no_end[:, 0] = False  # 排除 CLS（保持和你训练时 construct_pred 的习惯一致可调整）
-            return ids, seq_mask_no_end, torch.zeros_like(ids, dtype=torch.bool)
-        else:
-            seq_mask = generate_src_mask(max_len, seq_lens + 1)
-            return ids, seq_mask_no_end, seq_mask, torch.zeros_like(ids, dtype=torch.bool)
-
     if max_len == args.max_t:
-        seq_mask_no_end[:, 0] = False
-        r_indices = torch.randint(0, bitm_model.module.bert.config.vocab_size, ids.shape, device=device)
+        seq_mask_no_end[:, 0] = False  # 排除 CLS（保持和你训练时 construct_pred 的习惯一致可调整）
+        if no_corruption:
+            return ids, seq_mask_no_end, torch.zeros_like(ids, dtype=torch.bool)
+        r_indices = torch.randint(0, get_model(bitm_model).bert.config.vocab_size, ids.shape, device=curr_device)
     else:
-        r_indices = torch.randint(0, args.nb_code, ids.shape, device=device)
+        if no_corruption:
+            return ids, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), torch.zeros_like(ids,
+                                                                                                                    dtype=torch.bool)
+        r_indices = torch.randint(0, args.nb_code, ids.shape, device=curr_device)
 
     corrupt_selector = torch.logical_and(~mask, seq_mask_no_end)
     input_indices = torch.where(corrupt_selector, r_indices, ids)
@@ -185,23 +187,68 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, mask_id, probs: li
         # Force padding/CLS to have lowest priority in selection
         noise.masked_fill_(~seq_mask_no_end, -1.0)
 
+        # Create a 2D masking matrix for implementing scatter
+        mask_token = torch.zeros((batch_size, max_len), dtype=torch.bool, device=curr_device)
         # Use topk to get indices of tokens to mask
         _, mask_indices = torch.topk(noise, k=num_masked.max().item(), dim=-1)
-
-        # Create mask_token via scatter (faster than full sort)
-        mask_token = torch.zeros_like(ids, dtype=torch.bool)
-        mask_token.scatter_(1, mask_indices, True)
-        # Clean up in case different rows have different num_masked (This handles the clamp/round logic)
-        row_idx = torch.arange(max_len, device=device).unsqueeze(0)
-        mask_token &= (row_idx < num_masked.unsqueeze(1))
-
-    masked_input_indices = input_indices.masked_fill(mask_token, mask_id)
+        # Generate src for scatter: num_masked --> True, others --> False
+        src = torch.arange(mask_indices.shape[1], device=curr_device).unsqueeze(0) < num_masked.unsqueeze(1)
+        # Scatter: Invalid k --> False
+        mask_token.scatter_(1, mask_indices, src)
+        mask_token &= seq_mask_no_end  # 确保只 mask 有效 token
 
     if max_len == args.max_t:
+        masked_input_indices = input_indices.masked_fill(mask_token, tokenizer.mask_token_id)
         return masked_input_indices, seq_mask_no_end, mask_token
     else:
-        seq_mask = generate_src_mask(max_len, seq_lens + 1).to(torch.int64)
-        return masked_input_indices, seq_mask_no_end, seq_mask, mask_token
+        masked_input_indices = input_indices.masked_fill(mask_token, special_ids_m['mask_id'])
+        return masked_input_indices, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(
+            torch.int64), mask_token
+
+
+def task_routing_masking(token_ids_m, lens_m, probs_m: list, token_ids_t, lens_t, probs_t: list, batch_size,
+                         task_prob: float):
+    # 1. 生成任务分配掩码
+    rand_tensor = torch.rand(batch_size, device=token_ids_m.device)
+    is_mask_motion = rand_tensor < task_prob  # True: Mask Motion, False: Mask Text
+    mask_m_indices = torch.nonzero(is_mask_motion, as_tuple=True)[0]
+    mask_t_indices = torch.nonzero(~is_mask_motion, as_tuple=True)[0]
+
+    # 2. 得到各任务分别的 batch size
+    sub_bs_mask_m = mask_m_indices.shape[0]
+    sub_bs_mask_t = mask_t_indices.shape[0]
+
+    # 3. 初始化输出张量
+    final_ids_m = token_ids_m.clone()
+    final_ids_t = token_ids_t.clone()
+    final_mask_token_m = torch.zeros_like(token_ids_m, dtype=torch.bool)
+    final_mask_token_t = torch.zeros_like(token_ids_t, dtype=torch.bool)
+
+    # 4. 生成 seq_mask（这是序列长度属性，与路由无关）
+    _, seq_mask_no_end_m, seq_mask_m, _ = masking(token_ids_m, lens_m, batch_size, args.max_m, no_corruption=True)
+    _, seq_mask_no_end_t, _ = masking(token_ids_t, lens_t, batch_size, args.max_t, no_corruption=True)
+
+    # 5. 仅对需要 Mask Motion 的样本执行 Motion Masking
+    if sub_bs_mask_m > 0:
+        sub_m_ids = token_ids_m[mask_m_indices]
+        sub_m_lens = lens_m[mask_m_indices]
+        masked_m, _, _, mask_tok_m = masking(sub_m_ids, sub_m_lens, sub_bs_mask_m, args.max_m, probs_m)
+        # 填回原张量
+        final_ids_m.index_copy_(0, mask_m_indices, masked_m)
+        final_mask_token_m.index_copy_(0, mask_m_indices, mask_tok_m)
+
+    # 6. 仅对需要 Mask Text 的样本执行 Text Masking
+    if sub_bs_mask_t > 0:
+        sub_t_ids = token_ids_t[mask_t_indices]
+        sub_t_lens = lens_t[mask_t_indices]
+        masked_t, _, mask_tok_t = masking(sub_t_ids, sub_t_lens, sub_bs_mask_t, args.max_t, probs_t)
+        # 填回原张量
+        final_ids_t.index_copy_(0, mask_t_indices, masked_t)
+        final_mask_token_t.index_copy_(0, mask_t_indices, mask_tok_t)
+
+    return (final_ids_m, seq_mask_no_end_m, seq_mask_m, final_mask_token_m), (final_ids_t, seq_mask_no_end_t,
+                                                                              final_mask_token_t)
+
 
 ##### ---- Training ---- #####
 def get_pred_and_label(pred, ids, seq_mask_no_end):
@@ -213,9 +260,11 @@ def get_pred_and_label(pred, ids, seq_mask_no_end):
 
     return pred_seq_masked, target_seq_masked, weights_seq_masked
 
+
 def get_loss(pred_masked, target_masked, weights_masked):
     loss = F.cross_entropy(pred_masked, target_masked, reduction='none')
     return (loss * weights_masked).sum()
+
 
 def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     """
@@ -261,7 +310,8 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
 
     return loss_masked, loss_unmasked, loss_total
 
-def train(mask_probs):
+
+def train(mask_probs, task_prob):
     # Get masking probabilities
     probs_m, probs_t = mask_probs[0], mask_probs[1]
 
@@ -290,9 +340,6 @@ def train(mask_probs):
         token_ids_m, lens_m = token_ids_m.to(device), lens_m.to(device)
         bs, max_m = token_ids_m.shape[:2]  # (bs, 50)
 
-        mask_id_m = get_model(net).vqvae.num_code + 2
-        mask_id_t = tokenizer.mask_token_id  # [MASK] token id in ModernBERT
-
         # Encode all texts into text tokens for training
         text_inputs = tokenizer(text, padding='max_length', truncation=True, max_length=args.max_t, return_tensors='pt')
         token_ids_t = text_inputs['input_ids'].to(device)  # (bs, max_t)
@@ -302,16 +349,20 @@ def train(mask_probs):
         valid_mask_t = ~torch.isin(token_ids_t, torch.tensor(invalid_ids_t, device=device))
         lens_t = valid_mask_t.sum(dim=1)  # (bs,)
 
-        # Mask
-        masked_input_ids_m, seq_mask_no_end_m, seq_mask_m, mask_token_m = masking(token_ids_m, lens_m, bs, max_m, mask_id_m, probs_m)
-        masked_input_ids_t, seq_mask_no_end_t, mask_token_t = masking(token_ids_t, lens_t, bs, args.max_t, mask_id_t, probs_t)
-        
+        # Mask with task routing
+        out_m, out_t = task_routing_masking(token_ids_m, lens_m, probs_m, token_ids_t, lens_t, probs_t, bs,
+                                            task_prob=task_prob)
+        masked_input_ids_m, seq_mask_no_end_m, seq_mask_m, mask_token_m = out_m
+        masked_input_ids_t, seq_mask_no_end_t, mask_token_t = out_t
+
         # Train: forward
         logits = bitm_model(masked_input_ids_t, masked_input_ids_m, seq_mask_t, seq_mask_m)
 
         # Get predictions and targets
-        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(logits['logits_m'], token_ids_m, seq_mask_no_end_m)
-        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(logits['logits_t'], token_ids_t, seq_mask_no_end_t)
+        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(logits['logits_m'], token_ids_m,
+                                                                              seq_mask_no_end_m)
+        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(logits['logits_t'], token_ids_t,
+                                                                              seq_mask_no_end_t)
 
         # Compute loss
         loss_m = get_loss(pred_masked_m, target_masked_m, weights_masked_m)
@@ -358,25 +409,28 @@ def train(mask_probs):
             no_mask_token_m = ~mask_token_m * seq_mask_no_end_m
             no_mask_token_t = ~mask_token_t * seq_mask_no_end_t
             writer.add_scalar('./ACC/masked_motion', get_acc(logits['logits_m'], token_ids_m, mask_token_m), nb_iter)
-            writer.add_scalar('./ACC/no_masked_motion', get_acc(logits['logits_m'], token_ids_m, no_mask_token_m), nb_iter)
+            writer.add_scalar('./ACC/no_masked_motion', get_acc(logits['logits_m'], token_ids_m, no_mask_token_m),
+                              nb_iter)
             writer.add_scalar('./ACC/masked_text', get_acc(logits['logits_t'], token_ids_t, mask_token_t), nb_iter)
-            writer.add_scalar('./ACC/no_masked_text', get_acc(logits['logits_t'], token_ids_t, no_mask_token_t), nb_iter)
+            writer.add_scalar('./ACC/no_masked_text', get_acc(logits['logits_t'], token_ids_t, no_mask_token_t),
+                              nb_iter)
 
         if nb_iter == 0 or nb_iter % args.eval_iter == 0 or nb_iter == args.total_iter:
             # Test
             if nb_iter == args.total_iter:
                 num_repeat = -30
                 rand_pos = True
-                data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer, args.nb_code,
-                                                           batch_size=32, is_test=True, tokenizer_t=tokenizer,
-                                                           max_t=args.max_t)
+                data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer,
+                                                            args.nb_code,
+                                                            batch_size=32, is_test=True, tokenizer_t=tokenizer,
+                                                            max_t=args.max_t)
             # Validation
             else:
                 num_repeat = 1
                 rand_pos = False
                 data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_val_dir, w_vectorizer, args.nb_code,
-                                                           batch_size=32, is_test=False, tokenizer_t=tokenizer,
-                                                           max_t=args.max_t)
+                                                            batch_size=32, is_test=False, tokenizer_t=tokenizer,
+                                                            max_t=args.max_t)
             # T2M Evaluation
             best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
                 args.out_dir, data_loader, net, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
@@ -400,6 +454,7 @@ def train(mask_probs):
                 logger.info(msg_final)
                 break
 
+
 # Training: mix training
 # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
-train(mask_probs=((0.5, 1), (0, 0)))
+train(mask_probs=((0.5, 1), (0.5, 1)), task_prob=0.8)

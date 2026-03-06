@@ -303,6 +303,127 @@ def encode_val_motion_to_tokens(motion, m_length, net, args):
 
     return m_tokens, m_tokens_len
 
+@torch.no_grad()
+def make_ratio_mask(seq_mask_no_end: torch.Tensor,
+                    lengths: torch.Tensor,
+                    ratio_range=(0.5, 1.0),
+                    fixed_ratio: float = None):
+    """
+    seq_mask_no_end: (B, L) bool，有效内容 token
+    lengths: (B,) long，每个样本内容 token 数（不含 END）
+    ratio_range: (low, high) 每个样本随机采样 mask 比例
+    fixed_ratio: 如果给定，则所有样本用同一个 ratio（覆盖 ratio_range）
+    return:
+      mask_token: (B, L) bool
+      ratios: (B,) float  每个样本实际 ratio
+    """
+    B, L = seq_mask_no_end.shape
+    device = seq_mask_no_end.device
+
+    if fixed_ratio is not None:
+        ratios = torch.full((B,), float(fixed_ratio), device=device)
+    else:
+        low, high = ratio_range
+        ratios = torch.empty((B,), device=device).uniform_(low, high)
+
+    # 每个样本 mask 的 token 数，至少 1 个，最多 lengths
+    num_token_masked = (lengths.float() * ratios).round().clamp(min=1)
+    num_token_masked = torch.minimum(num_token_masked, lengths.float()).long()
+
+    # 训练里用的 trick：让 valid token 排到前面，再取前 K 个
+    # valid: rand in [-1,0) ; invalid: rand in [0,1)
+    batch_randperm = torch.rand((B, L), device=device) - seq_mask_no_end.int()
+    batch_rank = batch_randperm.argsort(dim=-1)
+    mask_token = batch_rank < num_token_masked.unsqueeze(1)
+
+    # 保证 invalid 位置不 mask（更稳）
+    mask_token = mask_token & seq_mask_no_end
+    return mask_token, ratios
+
+
+@torch.no_grad()
+def compute_eval_loss_mmm_ratio_mask(val_loader, args, net, trans_encoder, clip_model,
+                                     ratio_range=(0.5, 1.0),
+                                     fixed_ratio=None,
+                                     use_random_replace=True,
+                                     masked_only=False):
+    """
+    用“按 ratio 随机 mask token”的方式做 eval loss（更贴近 training）。
+    - ratio_range: 每个样本随机 ratio ∈ [low, high]
+    - fixed_ratio: 固定 ratio（如果不为 None）
+    - use_random_replace: 是否包含 training 的 Step1 随机替换（pkeep）
+    - masked_only: True=只在 mask_token 位置算loss；False=在所有 valid 位置算loss（与训练一致）
+    """
+    trans_encoder.eval()
+    clip_model.eval()
+    net.eval()
+
+    mask_id = get_model(net).vqvae.num_code + 2
+
+    total_loss = 0.0
+    total_weight = 0.0
+
+    for batch in val_loader:
+        # val loader: word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token_str, name
+        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token_str, name = batch
+        if isinstance(caption, tuple):
+            caption = list(caption)
+
+        motion = motion.cuda().float()
+        m_length = m_length.cuda()
+
+        # 1) 连续 motion -> tokens（与训练 token 格式对齐：内容+END+PAD）
+        m_tokens, m_tokens_len = encode_val_motion_to_tokens(motion, m_length, net, args)
+        bs, max_len = m_tokens.shape
+
+        # 2) masks
+        seq_mask_no_end = generate_src_mask(max_len, m_tokens_len)      # loss valid（内容token）
+        seq_mask = generate_src_mask(max_len, m_tokens_len + 1)         # attention valid（包含 END）
+
+        # 3) Step1: random replace（可选，想完全贴训练就打开）
+        if use_random_replace:
+            if args.pkeep == -1:
+                proba = float(torch.rand(1).item())
+                keep = torch.bernoulli(proba * torch.ones_like(m_tokens, dtype=torch.float, device=m_tokens.device))
+            else:
+                keep = torch.bernoulli(args.pkeep * torch.ones_like(m_tokens, dtype=torch.float, device=m_tokens.device))
+            keep = torch.logical_or(keep.bool(), ~seq_mask_no_end).int()
+            r_indices = torch.randint_like(m_tokens, args.nb_code)
+            input_indices = keep * m_tokens + (1 - keep) * r_indices
+        else:
+            input_indices = m_tokens
+
+        # 4) Step2: ratio random mask（关键）
+        mask_token, ratios = make_ratio_mask(seq_mask_no_end, m_tokens_len,
+                                             ratio_range=ratio_range, fixed_ratio=fixed_ratio)
+        masked_input_indices = torch.where(mask_token, mask_id, input_indices)
+
+        # 5) CLIP text
+        text_tok = clip.tokenize(caption, truncate=True).cuda()
+        feat_clip_text, word_emb = clip_model(text_tok)
+
+        # 6) forward（与训练对齐：[:,1:]）
+        logits = trans_encoder(masked_input_indices, feat_clip_text,
+                               src_mask=seq_mask, att_txt=None, word_emb=word_emb)[:, 1:]
+
+        # 7) weighted CE（与训练同权重：每个样本平均，再 batch 平均）
+        denom = seq_mask_no_end.sum(-1).clamp(min=1).unsqueeze(-1) * bs
+        weights = seq_mask_no_end.float() / denom  # (B,L)
+
+        valid = (mask_token & seq_mask_no_end) if masked_only else seq_mask_no_end
+
+        logits_valid = logits[valid].view(-1, logits.shape[-1])
+        target_valid = m_tokens[valid].view(-1)
+        w_valid = weights[valid].view(-1)
+
+        ce = F.cross_entropy(logits_valid, target_valid, reduction='none')
+        loss_batch = (ce * w_valid).sum()
+
+        total_loss += loss_batch.item()
+        total_weight += w_valid.sum().item()
+
+    trans_encoder.train()
+    return total_loss / max(total_weight, 1e-9)
 
 # while nb_iter <= args.total_iter:
 for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
@@ -400,6 +521,25 @@ for nb_iter in tqdm(range(1, args.total_iter + 1), position=0, leave=True):
             eval_loss = compute_eval_loss_mmm(val_loader, variant, args, net, trans_encoder, clip_model)
             writer.add_scalar(f'./Eval_Loss/{variant}/motion', eval_loss, nb_iter)
             logger.info(f"EvalLoss[{variant}] (iter {nb_iter}): {eval_loss:.4f}")
+
+        # 2) 更像“补全能力”的 masked-only
+        loss_val_masked = compute_eval_loss_mmm_ratio_mask(
+            val_loader, args, net, trans_encoder, clip_model,
+            fixed_ratio=0.75,
+            use_random_replace=True,
+            masked_only=True
+        )
+        logger.info(f"EvalLoss[masked-mask_only] (iter {nb_iter}): {loss_val_masked:.4f}")
+        writer.add_scalar('./Eval_Loss/trainlike/masked_only', loss_val_masked, nb_iter)
+
+        loss_val_masked_all = compute_eval_loss_mmm_ratio_mask(
+            val_loader, args, net, trans_encoder, clip_model,
+            fixed_ratio=0.75,
+            use_random_replace=True,
+            masked_only=False
+        )
+        logger.info(f"EvalLoss[masked-all] (iter {nb_iter}): {loss_val_masked_all:.4f}")
+        writer.add_scalar('./Eval_Loss/trainlike/masked-all', loss_val_masked_all, nb_iter)
 
         pred_pose_eval, pose, m_length, clip_text, best_fid, best_iter, best_div, best_top1, best_top2, best_top3, best_matching, best_multi, writer, logger = eval_trans.evaluation_transformer_old(
             args.out_dir, val_loader, net, trans_encoder, logger, writer, nb_iter, best_fid, best_iter, best_div,
