@@ -184,9 +184,9 @@ bitm_model = BiTMBERT(bert_name=bert_name,
                       dropout_rate=args.drop_out_rate)
 
 if args.resume_trans is not None:
-    print('loading transformer checkpoint from {}'.format(args.resume_trans))
+    print(f'loading transformer checkpoint from {args.resume_trans}')
     ckpt = torch.load(args.resume_trans, map_location='cpu')
-    bitm_model.load_state_dict(ckpt['trans'], strict=True)
+    bitm_model.load_state_dict(ckpt['bitm'], strict=True)
 bitm_model.to(device)
 bitm_model.train()
 bitm_model.motion_encoder.vq_model.eval()

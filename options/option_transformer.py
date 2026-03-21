@@ -53,7 +53,7 @@ def get_args_parser():
     parser.add_argument('--quantbeta', type=float, default=1.0, help='dataset directory')
 
     ## resume
-    parser.add_argument("--resume-trans", type=str, default=None, help='resume gpt pth')
+    parser.add_argument("--resume-trans", type=str, default='output/bitm/net_last_t.pth', help='resume gpt pth')
     
     ## output directory
     parser.add_argument('--vq-type', type=str, default='MoMask', help='VQVAE Type')

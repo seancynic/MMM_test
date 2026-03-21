@@ -3,7 +3,7 @@ import warnings
 import json
 import torch
 from os.path import join as pjoin
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, logging
 from torch.utils.tensorboard import SummaryWriter
 
 from options.option_transformer import get_args_parser
@@ -19,10 +19,11 @@ from models.bitm import BiTMBERT
 
 from utils.utils_model import get_logger
 from utils.eval_bitm_res import eval_bitm_t2m, eval_bitm_m2t
-from exit.utils import init_save_folder, fixseed
+from exit.utils import init_save_folder, fixseed, cosine_schedule, linear_schedule
 
 
 warnings.filterwarnings('ignore')
+logging.set_verbosity_error()
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 device = torch.device('cuda')
 
@@ -148,7 +149,7 @@ elif args.vq_type == 'MoMask':
         'pad_id': vq_opt.nb_code + 1,
         'mask_id': vq_opt.nb_code + 2,
     }  # Set motion special ids
-    curr_nb_code = args.nb_code
+    curr_nb_code = vq_opt.nb_code
 
 else:
     raise ValueError(f"Main: the VQ model {args.vq_type} is not supported.")
@@ -164,21 +165,21 @@ bitm_model = BiTMBERT(bert_name=bert_name,
                       dropout_rate=args.drop_out_rate)
 
 if args.resume_trans is not None:
-    print('loading transformer checkpoint from {}'.format(args.resume_trans))
+    print(f'loading transformer checkpoint from {args.resume_trans}')
     ckpt = torch.load(args.resume_trans, map_location='cpu')
-    bitm_model.load_state_dict(ckpt['trans'], strict=True)
+    bitm_model.load_state_dict(ckpt['bitm'], strict=True)
 bitm_model.to(device)
 bitm_model.eval()
 bitm_model = torch.nn.DataParallel(bitm_model)
 
 @torch.no_grad()
-def eval_only(split='test'):
+def eval_only(max_steps_t2m, max_steps_m2t, schedule_func_t2m, schedule_func_m2t, split='test'):
     # Get invalid ids for text
     invalid_ids_t = [special_ids_t['eos_id'], special_ids_t['pad_id']]
 
     # Choose dataset
     if split == 'test':
-        num_repeat = -30
+        num_repeat = -12
         rand_pos = True
         codebook_dir = codebook_test_dir
         is_test = True
@@ -202,8 +203,6 @@ def eval_only(split='test'):
 
     best_iter_t = 0
     best_bleu1 = 0.
-    best_bleu2 = 0.
-    best_bleu3 = 0.
     best_bleu4 = 0.
     best_rouge_l = 0.
     best_cider = 0.
@@ -212,26 +211,29 @@ def eval_only(split='test'):
     nb_iter = 0  # for log
 
     best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
-        args.out_dir, data_loader, net, args.vq_type, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, args.max_m,
+        args.out_dir, data_loader, net, args.vq_type, bitm_model, logger, writer, nb_iter, eval_wrapper, schedule_func_t2m,
+        special_ids_m, args.max_m,
         best_iter=best_iter_m, best_fid=best_fid, best_div=best_div,
         best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
-        num_repeat=num_repeat, rand_pos=rand_pos)
+        num_repeat=num_repeat, max_steps=max_steps_t2m, rand_pos=rand_pos)
 
     best_iter_t, best_bleu1, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_bitm_m2t(
-        args.out_dir, data_loader, bitm_model, logger, writer, nb_iter,
-        tokenizer, special_ids_t, invalid_ids_t, args.max_m, args.max_t,
+        args.out_dir, data_loader, bitm_model, logger, writer, nb_iter, tokenizer, schedule_func_m2t,
+        special_ids_t, invalid_ids_t, args.max_m, args.max_t,
         best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu4=best_bleu4,
         best_rouge_l=best_rouge_l, best_cider=best_cider, best_bert_f1=best_bert_f1,
-        num_repeat=num_repeat, rand_pos=rand_pos)
+        num_repeat=num_repeat, max_steps=max_steps_m2t, rand_pos=rand_pos)
 
     logger.info(
         f"[EVAL {split}] (t2m) FID {best_fid:.5f}, Div {best_div:.4f}, "
         f"TOP1 {best_top1:.4f}, TOP2 {best_top2:.4f}, TOP3 {best_top3:.4f}, Match {best_matching:.4f}"
     )
     logger.info(
-        f"[EVAL {split}] (m2t) BLEU1 {best_bleu1:.5f}, BLEU2 {best_bleu2:.4f}, BLEU3 {best_bleu3:.4f}, "
-        f"BLEU4 {best_bleu4:.4f}, ROUGE_L {best_rouge_l:.4f}, CIDEr {best_cider:.4f}, BERT_F1 {best_bert_f1:.4f}"
+        f"[EVAL {split}] (m2t) BLEU1 {best_bleu1:.5f}, BLEU4 {best_bleu4:.4f}, "
+        f"ROUGE_L {best_rouge_l:.4f}, CIDEr {best_cider:.4f}, BERT_F1 {best_bert_f1:.4f}"
     )
+
+    print(f'max_steps_m2t: {max_steps_m2t}')
 
     return {
         "fid": float(best_fid),
@@ -241,12 +243,13 @@ def eval_only(split='test'):
         "top3": float(best_top3),
         "matching": float(best_matching),
         "bleu1": float(best_bleu1),
-        "bleu2": float(best_bleu2),
-        "bleu3": float(best_bleu3),
         "bleu4": float(best_bleu4),
         "rouge_l": float(best_rouge_l),
         "cider": float(best_cider),
         "bert_f1": float(best_bert_f1),
     }
 
-bests = eval_only(split='test')
+bests = eval_only(max_steps_t2m=10,
+                  max_steps_m2t=30,
+                  schedule_func_t2m=cosine_schedule,
+                  schedule_func_m2t=linear_schedule)  # cosine_schedule or linear_schedule

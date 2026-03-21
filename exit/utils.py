@@ -270,6 +270,9 @@ def uniform(shape, device = None):
 def cosine_schedule(t):
     return torch.cos(t * math.pi * 0.5)
 
+def linear_schedule(t):
+    return 1. - t
+
 # More on small value, less on large
 def q_schedule(bs, low, high, device):
     noise = uniform((bs,), device=device)
