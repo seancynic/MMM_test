@@ -4,7 +4,7 @@ import numpy as np
 from scipy import linalg
 from tqdm import tqdm
 from einops import rearrange
-from exit.utils import get_model, generate_src_mask, cosine_schedule, gumbel_sample
+from exit.utils import get_model, generate_src_mask, gumbel_sample
 
 from nltk.translate.bleu_score import sentence_bleu
 from rouge_score import rouge_scorer
@@ -143,7 +143,7 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
     return dist
 
 def inference_t2m(model, lens_m: torch.Tensor, token_ids_t, seq_mask_t, seq_mask_m, seq_mask_no_end_m,
-             special_ids_m, max_length, shape, rand_pos=True, token_cond=None, max_steps=10):
+             special_ids_m, shape, max_length, max_steps, schedule_func, rand_pos=True, token_cond=None):
     # init sampling score
     scores = torch.ones(shape, dtype=torch.float32, device=lens_m.device)
 
@@ -160,7 +160,7 @@ def inference_t2m(model, lens_m: torch.Tensor, token_ids_t, seq_mask_t, seq_mask
         timestep = torch.clip(step / sample_max_steps, max=1)
         if len(lens_m) == 1 and step > 0 and torch.clip((step - 1) / sample_max_steps, max=1).cpu().item() == timestep:
             break
-        rand_mask_prob = cosine_schedule(timestep)
+        rand_mask_prob = schedule_func(timestep)
         num_token_masked = (rand_mask_prob * lens_m).long().clip(min=1)
 
         if token_cond is not None:
@@ -205,9 +205,10 @@ def inference_t2m(model, lens_m: torch.Tensor, token_ids_t, seq_mask_t, seq_mask
     return token_ids_m
 
 @torch.no_grad()
-def eval_bitm_t2m(out_dir, val_loader, vq_model, vq_type, bitm, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
+def eval_bitm_t2m(out_dir, val_loader, vq_model, vq_type, bitm, logger, writer, nb_iter, eval_wrapper, schedule_func,
+                  special_ids_m, max_m,
                   best_iter=0, best_fid=1000, best_div=100, best_top1=0, best_top2=0, best_top3=0, best_matching=100,
-                  draw=True, save=True, num_repeat=1, rand_pos=False):
+                  draw=True, save=True, num_repeat=1, max_steps=10, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
         is_avg_all = True
         num_repeat = -num_repeat
@@ -244,8 +245,10 @@ def eval_bitm_t2m(out_dir, val_loader, vq_model, vq_type, bitm, logger, writer, 
                                          seq_mask_m=seq_mask_m.cuda(),
                                          seq_mask_no_end_m=seq_mask_no_end_m.cuda(),
                                          special_ids_m=special_ids_m,
-                                         max_length=max_m - 1,
                                          shape=(bs, max_m),
+                                         max_length=max_m - 1,
+                                         max_steps=max_steps,
+                                         schedule_func=schedule_func,
                                          rand_pos=rand_pos)  # (bs, max_m)
 
             # [INFO] need to run single sample at a time because it's conv
@@ -402,7 +405,7 @@ def compute_rouge_l(preds, refs, scorer=None):
     return rouge_l_f / len(preds)
 
 def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask_t, seq_mask_no_end_t,
-             special_ids_t, max_length, shape, rand_pos=True, token_cond=None, max_steps=10):
+             special_ids_t, shape, max_length, max_steps, schedule_func, rand_pos=True, token_cond=None):
     # init sampling score
     scores = torch.ones(shape, dtype=torch.float32, device=lens_t.device)
 
@@ -420,7 +423,7 @@ def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask
         timestep = torch.clip(step / sample_max_steps, max=1)
         if len(lens_t) == 1 and step > 0 and torch.clip((step - 1) / sample_max_steps, max=1).cpu().item() == timestep:
             break
-        rand_mask_prob = cosine_schedule(timestep)
+        rand_mask_prob = schedule_func(timestep)
         num_token_masked = (rand_mask_prob * lens_t).long().clip(min=1)
 
         if token_cond is not None:
@@ -466,9 +469,10 @@ def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask
     return token_ids_t
 
 @torch.no_grad()
-def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer, special_ids_t, invalid_ids, max_m, max_t,
+def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer, schedule_func,
+                  special_ids_t, invalid_ids, max_m, max_t,
                   best_iter=0., best_bleu1=0., best_bleu4=0., best_rouge_l=0., best_cider=0., best_bert_f1=0.,
-                  draw=True, save=True, num_repeat=1, rand_pos=False):
+                  draw=True, save=True, num_repeat=1, max_steps=10, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
         is_avg_all = True
         num_repeat = -num_repeat
@@ -518,8 +522,10 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
                                        seq_mask_t=seq_mask_t.cuda(),
                                        seq_mask_no_end_t=seq_mask_no_end_t.cuda(),
                                        special_ids_t=special_ids_t,
-                                       max_length=max_t - 1,
                                        shape=(bs, max_t),
+                                       max_length=max_t - 1,
+                                       max_steps=max_steps,
+                                       schedule_func=schedule_func,
                                        rand_pos=rand_pos)  # (bs, max_t)
             pred_text = decode_token_ids(index_text, tokenizer, eos_id=special_ids_t['eos_id'])
 
@@ -527,7 +533,7 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
                 metric_batches.append((pred_text, captions, bs))
                 nb_sample += bs
 
-    for pred_text, captions, bs in metric_batches:
+    for pred_text, captions, bs in tqdm(metric_batches):
         rouge_l += compute_rouge_l(pred_text, captions, scorer=rouge_scorer_obj) * bs
         bleu_scores = compute_bleu_scores(pred_text, captions)
         bleu1 += bleu_scores['BLEU-1']* bs
