@@ -351,6 +351,8 @@ def train(mask_probs, task_prob):
 
     best_iter_t = 0
     best_bleu1 = 0.
+    best_bleu2 = 0.
+    best_bleu3 = 0.
     best_bleu4 = 0.
     best_rouge_l = 0.
     best_cider = 0.
@@ -443,14 +445,14 @@ def train(mask_probs, task_prob):
                 data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer,
                                                             args.nb_code,
                                                             batch_size=32, is_test=True, tokenizer_t=tokenizer,
-                                                            max_t=args.max_t)
+                                                            max_t=args.max_t, return_all_captions=True)
             # Validation
             else:
                 num_repeat = 1
                 rand_pos = False
                 data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_val_dir, w_vectorizer, args.nb_code,
                                                             batch_size=32, is_test=False, tokenizer_t=tokenizer,
-                                                            max_t=args.max_t)
+                                                            max_t=args.max_t, return_all_captions=True)
             # T2M Evaluation
             best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
                 args.out_dir, data_loader, net, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
@@ -458,23 +460,24 @@ def train(mask_probs, task_prob):
                 best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
                 num_repeat=num_repeat, rand_pos=rand_pos)
             # M2T Evaluation
-            best_iter_t, best_bleu1, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_bitm_m2t(
+            best_iter_t, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1 = eval_bitm_m2t(
                 args.out_dir, data_loader, bitm_model, logger, writer, nb_iter,
                 tokenizer, special_ids_t, invalid_ids_t, max_m, args.max_t,
-                best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu4=best_bleu4,
-                best_rouge_l=best_rouge_l, best_cider=best_cider, best_bert_f1=best_bert_f1,
+                best_iter=best_iter_t, best_bleu1=best_bleu1, best_bleu2=best_bleu2, best_bleu3=best_bleu3,
+                best_bleu4=best_bleu4, best_rouge_l=best_rouge_l, best_cider=best_cider, best_bert_f1=best_bert_f1,
                 num_repeat=num_repeat, rand_pos=rand_pos)
 
             if nb_iter == args.total_iter:
                 msg_final = (f"Train (T2M). Iter {best_iter_m}: FID. {best_fid:.5f}, Diversity. {best_div:.4f}, "
                              f"TOP1. {best_top1:.4f}, TOP2. {best_top2:.4f}, TOP3. {best_top3:.4f}")
                 logger.info(msg_final)
-                msg_final = (f"Train (M2T). Iter {best_iter_t}: BLEU1. {best_bleu1:.5f}, BLEU4. {best_bleu4:.4f}, "
-                             f"ROUGE-L. {best_rouge_l:.4f}, CIDEr. {best_cider:.4f}, BERT-F1. {best_bert_f1:.4f}")
+                msg_final = (f"Train (M2T). Iter {best_iter_t}: BLEU1. {best_bleu1:.5f}, BLEU2. {best_bleu2:.4f}, "
+                             f"BLEU3. {best_bleu3:.4f}, BLEU4. {best_bleu4:.4f}, ROUGE-L. {best_rouge_l:.4f}, "
+                             f"CIDEr. {best_cider:.4f}, BERT-F1. {best_bert_f1:.4f}")
                 logger.info(msg_final)
                 break
 
 
 # Training: mix training
 # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
-train(mask_probs=((0.5, 1), (0.2, 1)), task_prob=0.5)
+train(mask_probs=((0, 1), (0, 1)), task_prob=0.2)

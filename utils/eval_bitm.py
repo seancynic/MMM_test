@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 import torch
 import numpy as np
 from scipy import linalg
@@ -6,14 +8,34 @@ from tqdm import tqdm
 from einops import rearrange
 from exit.utils import get_model, generate_src_mask, cosine_schedule, gumbel_sample
 
-from nltk.translate.bleu_score import sentence_bleu
-from rouge_score import rouge_scorer
-
 try:
     from nlgmetricverse import NLGMetricverse, load_metric
+    import nlgmetricverse.metrics._core.base as nlg_base
+    import nlgmetricverse.metrics._core.utils as nlg_utils
 except ImportError:
     NLGMetricverse = None
     load_metric = None
+    nlg_base = None
+    nlg_utils = None
+else:
+    def _safe_import_module(module_name, filepath):
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, "__file__", None) == filepath:
+            return module
+
+        # nlgmetricverse BLEU downloads a tiny external script and imports it
+        # via importlib. On this environment the default loader trips over a
+        # stale/incompatible bytecode path on Python 3.12, so load from source.
+        module = types.ModuleType(module_name)
+        module.__file__ = filepath
+        with open(filepath, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        exec(compile(source, filepath, "exec"), module.__dict__)
+        sys.modules[module_name] = module
+        return module
+
+    nlg_utils.import_module = _safe_import_module
+    nlg_base.import_module = _safe_import_module
 
 try:
     # the bert_score package exposes a `score` function
@@ -369,65 +391,43 @@ def decode_token_ids(token_ids, tokenizer, eos_id):
 
     return tokenizer.batch_decode(batch_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
-def compute_bleu_scores(preds, refs):
-    bleu1, bleu4 = 0., 0.
-    for pred, ref in zip(preds, refs):
-        pred_tokens = pred.split()
-        ref_tokens = ref.split()
-        bleu1 += sentence_bleu([ref_tokens], pred_tokens, weights=(1, 0, 0, 0))
-        bleu4 += sentence_bleu([ref_tokens], pred_tokens, weights=(0.25, 0.25, 0.25, 0.25))
+def inference_m2t(model, token_ids_m, seq_mask_m, special_ids_t, shape, rand_pos=True, token_cond=None, max_steps=10):
+    batch_size, max_t = shape
+    device = token_ids_m.device
+    max_length = max_t - 1
 
-    return {
-        "BLEU-1": bleu1 / len(preds),
-        "BLEU-4": bleu4 / len(preds),
-    }
+    # Full-horizon generation: only [CLS] is reserved.
+    seq_mask_t = torch.ones(shape, dtype=torch.bool, device=device)
+    valid_text_mask = torch.ones(shape, dtype=torch.bool, device=device)
+    valid_text_mask[:, 0] = False
 
-def compute_rouge_l(preds, refs, scorer=None):
-    if scorer is None:
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-    rouge_l_f = 0.
-    for pred, ref in zip(preds, refs):
-        score = scorer.score(ref, pred)
-        rouge_l_f += score['rougeL'].fmeasure
-
-    return rouge_l_f / len(preds)
-
-def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask_t, seq_mask_no_end_t,
-             special_ids_t, max_length, shape, rand_pos=True, token_cond=None, max_steps=10):
     # init sampling score
-    scores = torch.ones(shape, dtype=torch.float32, device=lens_t.device)
+    scores = valid_text_mask.float()
 
     # init text token ids
     if token_cond is not None:  # has partial condition
         token_ids_t = token_cond.clone()
-        token_ids_t[~seq_mask_no_end_t] = special_ids_t['pad_id']
-        num_token_cond = (token_ids_t == special_ids_t['mask_id']).sum(-1)
+        token_ids_t[:, 0] = special_ids_t['cls_id']
+        num_token_cond = (token_ids_t == special_ids_t['mask_id']).sum(-1).clamp(min=1)
     else:  # start from full mask
-        token_ids_t = torch.full(shape, special_ids_t['mask_id'], dtype=torch.long, device=lens_t.device)
+        token_ids_t = torch.full(shape, special_ids_t['mask_id'], dtype=torch.long, device=device)
         token_ids_t[:, 0] = special_ids_t['cls_id']  # add [CLS] token for text
 
-    sample_max_steps = torch.round(max_steps / max_length * lens_t) + 1e-8
     for step in range(max_steps):
-        timestep = torch.clip(step / sample_max_steps, max=1)
-        if len(lens_t) == 1 and step > 0 and torch.clip((step - 1) / sample_max_steps, max=1).cpu().item() == timestep:
-            break
+        timestep = torch.full((batch_size,), step / max_steps, dtype=torch.float32, device=device)
         rand_mask_prob = cosine_schedule(timestep)
-        num_token_masked = (rand_mask_prob * lens_t).long().clip(min=1)
+        num_token_masked = (rand_mask_prob * max_length).long().clip(min=1)
 
         if token_cond is not None:
             num_token_masked = (rand_mask_prob * num_token_cond).long().clip(min=1)
             scores[token_cond != special_ids_t['mask_id']] = 0
 
-        # Set sampling score to 0 for [PAD] and [CLS]
-        scores[~seq_mask_no_end_t] = 0
+        # Only sample over non-CLS positions that are still active.
+        scores[~valid_text_mask] = 0
         scores[:, 0] = 0
         scores = scores / scores.sum(-1)[:, None]  # normalize only unmasked token
 
         _, sorted_score_indices = scores.sort(descending=True)  # deterministic
-
-        token_ids_t[~seq_mask_t] = special_ids_t['pad_id']  # replace with pad id
-        token_ids_t.scatter_(-1, lens_t[..., None].long(), special_ids_t['eos_id'])  # replace with end id
 
         # replace "mask_id" to "ids" that have highest "num_token_masked" "scores"
         select_masked_indices = generate_src_mask(sorted_score_indices.shape[1], num_token_masked)
@@ -459,7 +459,8 @@ def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask
 
 @torch.no_grad()
 def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer, special_ids_t, invalid_ids, max_m, max_t,
-                  best_iter=0., best_bleu1=0., best_bleu4=0., best_rouge_l=0., best_cider=0., best_bert_f1=0.,
+                  best_iter=0., best_bleu1=0., best_bleu2=0., best_bleu3=0., best_bleu4=0., best_rouge_l=0.,
+                  best_cider=0., best_bert_f1=0.,
                   draw=True, save=True, num_repeat=1, rand_pos=False):
     if num_repeat < 0:  # evaluate all generations
         is_avg_all = True
@@ -467,88 +468,67 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
     else:  # evaluate last generation
         is_avg_all = False
 
-    rouge_scorer_obj = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    if NLGMetricverse is None or load_metric is None:
+        raise ImportError("BiTM m2t eval now requires nlgmetricverse to match MotionGPT-style NLP metrics.")
+    if bert_score is None:
+        raise ImportError("BiTM m2t eval now requires bert_score to match MotionGPT-style BERT-F1.")
 
-    # set up evaluators for CIDEr and BERT F1 if the libraries are available
-    if NLGMetricverse is not None and load_metric is not None:
-        # Only the CIDEr metric is loaded here; BLEU and ROUGE are computed elsewhere
-        _cider_metrics = [load_metric("cider")]
-        nlg_evaluator = NLGMetricverse(_cider_metrics)
-    else:
-        nlg_evaluator = None
+    nlg_evaluator = NLGMetricverse([
+        load_metric("bleu", resulting_name="bleu_1", compute_kwargs={"max_order": 1}),
+        load_metric("bleu", resulting_name="bleu_2", compute_kwargs={"max_order": 2}),
+        load_metric("bleu", resulting_name="bleu_3", compute_kwargs={"max_order": 3}),
+        load_metric("bleu", resulting_name="bleu_4", compute_kwargs={"max_order": 4}),
+        load_metric("rouge"),
+        load_metric("cider"),
+    ])
 
     bitm.eval()
-    nb_sample = 0
-    bleu1 = 0.
-    bleu4 = 0.
-    rouge_l = 0.
-    cider_score = 0.
-    bert_f1 = 0.
-    metric_batches = []
+    all_pred_text = []
+    all_reference_texts = []
 
     for batch in tqdm(val_loader, position=2, leave=True):
-        word_embeddings, pos_one_hots, sent_len, token_ids_m, pose, m_length, token_ids_t, seq_mask_t, captions = batch
+        word_embeddings, pos_one_hots, sent_len, token_ids_m, pose, m_length, token_ids_t, seq_mask_t, captions, all_captions = batch
         bs, seq = pose.shape[:2]
         lens_m = torch.ceil(m_length / 4).long()
-
-        # Get lengths for each text in batch
-        t_valid_mask = ~torch.isin(token_ids_t.cuda(), torch.tensor(invalid_ids).cuda())
-        lens_t = t_valid_mask.sum(dim=1)
 
         # Get motion mask
         seq_mask_m = generate_src_mask(max_m, lens_m + 1)
 
-        # generate target token masks
-        seq_mask_t = generate_src_mask(max_t, lens_t + 1)  # target token: text
-        seq_mask_no_end_t = generate_src_mask(max_t, lens_t)  # target token: text
-
         for i in range(num_repeat):
             index_text = inference_m2t(bitm,
-                                       lens_t=lens_t.cuda(),
                                        token_ids_m=token_ids_m.cuda(),
                                        seq_mask_m=seq_mask_m.cuda(),
-                                       seq_mask_t=seq_mask_t.cuda(),
-                                       seq_mask_no_end_t=seq_mask_no_end_t.cuda(),
                                        special_ids_t=special_ids_t,
-                                       max_length=max_t - 1,
                                        shape=(bs, max_t),
                                        rand_pos=rand_pos)  # (bs, max_t)
             pred_text = decode_token_ids(index_text, tokenizer, eos_id=special_ids_t['eos_id'])
 
             if i == 0 or is_avg_all:
-                metric_batches.append((pred_text, captions, bs))
-                nb_sample += bs
+                all_pred_text.extend(pred_text)
+                all_reference_texts.extend(all_captions)
 
-    for pred_text, captions, bs in metric_batches:
-        rouge_l += compute_rouge_l(pred_text, captions, scorer=rouge_scorer_obj) * bs
-        bleu_scores = compute_bleu_scores(pred_text, captions)
-        bleu1 += bleu_scores['BLEU-1']* bs
-        bleu4 += bleu_scores['BLEU-4']* bs
+    scores = nlg_evaluator(predictions=all_pred_text, references=all_reference_texts)
+    bleu1 = scores["bleu_1"]["score"]
+    bleu2 = scores["bleu_2"]["score"]
+    bleu3 = scores["bleu_3"]["score"]
+    bleu4 = scores["bleu_4"]["score"]
+    rouge_l = scores["rouge"]["rougeL"]
+    cider_score = scores["cider"]["score"]
 
-        # compute CIDEr using nlgmetricverse (if available)
-        if nlg_evaluator is not None:
-            references = [[c] for c in captions]
-            # nlg_evaluator returns a dict keyed by metric names
-            _scores = nlg_evaluator(predictions=list(pred_text), references=references)
-            cider_value = _scores["cider"]["score"]
-            cider_score += cider_value * bs
-        # compute BERT F1 using bert_score (if available)
-        if bert_score is not None:
-            pred_text = list(pred_text)
-            captions = list(captions)
-
-            P, R, F1 = bert_score(pred_text, captions, lang="en", rescale_with_baseline=True, idf=True, verbose=False)
-            bert_f1 += F1.sum().item()
-
-    bleu1 = bleu1 / nb_sample
-    bleu4 = bleu4 / nb_sample
-    rouge_l = rouge_l / nb_sample
-
-    cider_score = cider_score / nb_sample if nb_sample > 0 else 0.0
-    bert_f1 = bert_f1 / nb_sample if nb_sample > 0 else 0.0
+    _, _, bert_f1_tensor = bert_score(
+        all_pred_text,
+        all_reference_texts,
+        lang="en",
+        rescale_with_baseline=True,
+        idf=True,
+        verbose=False
+    )
+    bert_f1 = bert_f1_tensor.mean().item()
 
     msg = f"--> \t Eva. Iter {nb_iter} :, \n\
                 bleu1. {bleu1}, \n\
+                bleu2. {bleu2}, \n\
+                bleu3. {bleu3}, \n\
                 bleu4. {bleu4}, \n\
                 rouge_l. {rouge_l:.4f}, \n\
                 cidEr. {cider_score:.4f}, \n\
@@ -558,6 +538,8 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
 
     if draw:
         writer.add_scalar('./Test/bleu1', bleu1, nb_iter)
+        writer.add_scalar('./Test/bleu2', bleu2, nb_iter)
+        writer.add_scalar('./Test/bleu3', bleu3, nb_iter)
         writer.add_scalar('./Test/bleu4', bleu4, nb_iter)
         writer.add_scalar('./Test/rouge_l', rouge_l, nb_iter)
         writer.add_scalar('./Test/cider', cider_score, nb_iter)
@@ -567,6 +549,16 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
         msg = f"--> --> \t BLEU1 Improved from {best_bleu1:.4f} to {bleu1:.4f} !!!"
         logger.info(msg)
         best_bleu1 = bleu1
+
+    if bleu2 > best_bleu2:
+        msg = f"--> --> \t BLEU2 Improved from {best_bleu2:.4f} to {bleu2:.4f} !!!"
+        logger.info(msg)
+        best_bleu2 = bleu2
+
+    if bleu3 > best_bleu3:
+        msg = f"--> --> \t BLEU3 Improved from {best_bleu3:.4f} to {bleu3:.4f} !!!"
+        logger.info(msg)
+        best_bleu3 = bleu3
 
     if bleu4 > best_bleu4:
         msg = f"--> --> \t BLEU4 Improved from {best_bleu4:.4f} to {bleu4:.4f} !!!"
@@ -592,4 +584,4 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
         torch.save({'bitm': get_model(bitm).state_dict()}, os.path.join(out_dir, 'net_last_t.pth'))
 
     bitm.train()
-    return best_iter, best_bleu1, best_bleu4, best_rouge_l, best_cider, best_bert_f1
+    return best_iter, best_bleu1, best_bleu2, best_bleu3, best_bleu4, best_rouge_l, best_cider, best_bert_f1
