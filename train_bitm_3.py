@@ -138,6 +138,9 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
 
 def get_acc(cls_pred, target, mask):
     # Only look at the indices where mask is True
+    if mask.sum() == 0:
+        return cls_pred.new_tensor(0.0)
+
     active_outputs = cls_pred[mask]
     active_targets = target[mask]
 
@@ -152,56 +155,31 @@ def get_acc(cls_pred, target, mask):
 ##### ---- Masking ---- #####
 def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, probs: list = None, no_corruption: bool = False):
     curr_device = ids.device
-    if args.pkeep == -1:
-        proba = torch.rand(1, device=curr_device)
-        mask = torch.rand(ids.shape, device=curr_device) < proba
-    else:
-        mask = torch.rand(ids.shape, device=curr_device) < args.pkeep
 
-    # Step 1: Random only real token. To prevent pad token got mixed up.
+    # Build the valid-token mask first so masking only applies to real tokens.
     seq_mask_no_end = generate_src_mask(max_len, seq_lens)
     if max_len == args.max_t:
-        seq_mask_no_end[:, 0] = False  # 排除 CLS（保持和你训练时 construct_pred 的习惯一致可调整）
+        seq_mask_no_end[:, 0] = False  # Never mask [CLS]
         if no_corruption:
             return ids, seq_mask_no_end, torch.zeros_like(ids, dtype=torch.bool)
-        r_indices = torch.randint(0, get_model(bitm_model).bert.config.vocab_size, ids.shape, device=curr_device)
     else:
         if no_corruption:
             return ids, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), torch.zeros_like(ids,
                                                                                                                     dtype=torch.bool)
-        r_indices = torch.randint(0, args.nb_code, ids.shape, device=curr_device)
 
-    corrupt_selector = torch.logical_and(~mask, seq_mask_no_end)
-    input_indices = torch.where(corrupt_selector, r_indices, ids)
-
-    # Step 2: Time-step masking
+    # Per-sample masking probability u ~ Uniform(probs[0], probs[1]);
+    # each valid token is masked independently with probability u.
     if probs[0] == 0 and probs[1] == 0:
         mask_token = torch.zeros_like(ids, dtype=torch.bool)
     else:
-        # Vectorized probability sampling
-        rand_probs = (probs[1] - probs[0]) * torch.rand(batch_size, device=device) + probs[0]
-        num_masked = (seq_lens * rand_probs).round().clamp(min=1).long()
-
-        # Selection using topk
-        noise = torch.rand((batch_size, max_len), device=device)
-        # Force padding/CLS to have lowest priority in selection
-        noise.masked_fill_(~seq_mask_no_end, -1.0)
-
-        # Create a 2D masking matrix for implementing scatter
-        mask_token = torch.zeros((batch_size, max_len), dtype=torch.bool, device=curr_device)
-        # Use topk to get indices of tokens to mask
-        _, mask_indices = torch.topk(noise, k=num_masked.max().item(), dim=-1)
-        # Generate src for scatter: num_masked --> True, others --> False
-        src = torch.arange(mask_indices.shape[1], device=curr_device).unsqueeze(0) < num_masked.unsqueeze(1)
-        # Scatter: Invalid k --> False
-        mask_token.scatter_(1, mask_indices, src)
-        mask_token &= seq_mask_no_end  # 确保只 mask 有效 token
+        rand_probs = (probs[1] - probs[0]) * torch.rand(batch_size, 1, device=curr_device) + probs[0]
+        mask_token = (torch.rand(ids.shape, device=curr_device) < rand_probs) & seq_mask_no_end
 
     if max_len == args.max_t:
-        masked_input_indices = input_indices.masked_fill(mask_token, tokenizer.mask_token_id)
+        masked_input_indices = ids.masked_fill(mask_token, tokenizer.mask_token_id)
         return masked_input_indices, seq_mask_no_end, mask_token
     else:
-        masked_input_indices = input_indices.masked_fill(mask_token, special_ids_m['mask_id'])
+        masked_input_indices = ids.masked_fill(mask_token, special_ids_m['mask_id'])
         return masked_input_indices, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(
             torch.int64), mask_token
 
@@ -477,4 +455,4 @@ def train(mask_probs, task_prob):
 
 # Training: mix training
 # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
-train(mask_probs=((0.5, 1), (0.2, 1)), task_prob=0.5)
+train(mask_probs=((0, 1), (0, 1)), task_prob=0.5)
