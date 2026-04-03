@@ -12,11 +12,13 @@ try:
     from nlgmetricverse import NLGMetricverse, load_metric
     import nlgmetricverse.metrics._core.base as nlg_base
     import nlgmetricverse.metrics._core.utils as nlg_utils
+    from nlgmetricverse.utils.string import normalize_text as nlg_normalize_text
 except ImportError:
     NLGMetricverse = None
     load_metric = None
     nlg_base = None
     nlg_utils = None
+    nlg_normalize_text = None
 else:
     def _safe_import_module(module_name, filepath):
         module = sys.modules.get(module_name)
@@ -400,18 +402,30 @@ def prepare_text_metric_inputs(predictions, references):
 
     for pred, refs in zip(predictions, references):
         pred = "" if pred is None else pred.strip()
+        pred_norm = pred if nlg_normalize_text is None else nlg_normalize_text(pred)
 
         refs = [] if refs is None else list(refs)
-        refs = [ref.strip() for ref in refs if ref is not None and ref.strip()]
+        clean_refs = []
+        for ref in refs:
+            if ref is None:
+                continue
+            ref = ref.strip()
+            if not ref:
+                continue
+            ref_norm = ref if nlg_normalize_text is None else nlg_normalize_text(ref)
+            if not ref_norm.split():
+                continue
+            clean_refs.append(ref)
 
-        # nlgmetricverse BLEU crashes on whitespace-only predictions/references.
-        # Match its effective "skip empty item" behavior, but do it explicitly.
-        if not pred or len(refs) == 0:
+        # nlgmetricverse normalizes punctuation away before tokenization.
+        # Strings like "." or "!!!" become empty token lists and crash its
+        # `collapse()` path, so filter with the same normalization rule.
+        if not pred_norm.split() or len(clean_refs) == 0:
             skipped += 1
             continue
 
         clean_predictions.append(pred)
-        clean_references.append(refs)
+        clean_references.append(clean_refs)
 
     return clean_predictions, clean_references, skipped
 
