@@ -393,6 +393,28 @@ def decode_token_ids(token_ids, tokenizer, eos_id):
 
     return tokenizer.batch_decode(batch_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
+def prepare_text_metric_inputs(predictions, references):
+    clean_predictions = []
+    clean_references = []
+    skipped = 0
+
+    for pred, refs in zip(predictions, references):
+        pred = "" if pred is None else pred.strip()
+
+        refs = [] if refs is None else list(refs)
+        refs = [ref.strip() for ref in refs if ref is not None and ref.strip()]
+
+        # nlgmetricverse BLEU crashes on whitespace-only predictions/references.
+        # Match its effective "skip empty item" behavior, but do it explicitly.
+        if not pred or len(refs) == 0:
+            skipped += 1
+            continue
+
+        clean_predictions.append(pred)
+        clean_references.append(refs)
+
+    return clean_predictions, clean_references, skipped
+
 def inference_m2t(model, token_ids_m, seq_mask_m, special_ids_t, shape, rand_pos=True, token_cond=None, max_steps=10):
     batch_size, max_t = shape
     device = token_ids_m.device
@@ -509,23 +531,35 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
                 all_pred_text.extend(pred_text)
                 all_reference_texts.extend(all_captions)
 
-    scores = nlg_evaluator(predictions=all_pred_text, references=all_reference_texts)
-    bleu1 = scores["bleu_1"]["score"]
-    bleu2 = scores["bleu_2"]["score"]
-    bleu3 = scores["bleu_3"]["score"]
-    bleu4 = scores["bleu_4"]["score"]
-    rouge_l = scores["rouge"]["rougeL"]
-    cider_score = scores["cider"]["score"]
+    metric_pred_text, metric_reference_texts, skipped_empty = prepare_text_metric_inputs(all_pred_text, all_reference_texts)
 
-    _, _, bert_f1_tensor = bert_score(
-        all_pred_text,
-        all_reference_texts,
-        lang="en",
-        rescale_with_baseline=True,
-        idf=True,
-        verbose=False
-    )
-    bert_f1 = bert_f1_tensor.mean().item()
+    if skipped_empty > 0:
+        logger.info(f"--> \t Skipped {skipped_empty} empty text-eval samples before metric computation.")
+
+    if len(metric_pred_text) == 0:
+        logger.info("--> \t No valid text-eval samples remained after filtering empty predictions/references.")
+        bleu1 = bleu2 = bleu3 = bleu4 = 0.
+        rouge_l = 0.
+        cider_score = 0.
+        bert_f1 = 0.
+    else:
+        scores = nlg_evaluator(predictions=metric_pred_text, references=metric_reference_texts)
+        bleu1 = scores["bleu_1"]["score"]
+        bleu2 = scores["bleu_2"]["score"]
+        bleu3 = scores["bleu_3"]["score"]
+        bleu4 = scores["bleu_4"]["score"]
+        rouge_l = scores["rouge"]["rougeL"]
+        cider_score = scores["cider"]["score"]
+
+        _, _, bert_f1_tensor = bert_score(
+            metric_pred_text,
+            metric_reference_texts,
+            lang="en",
+            rescale_with_baseline=True,
+            idf=True,
+            verbose=False
+        )
+        bert_f1 = bert_f1_tensor.mean().item()
 
     msg = f"--> \t Eva. Iter {nb_iter} :, \n\
                 bleu1. {bleu1}, \n\
