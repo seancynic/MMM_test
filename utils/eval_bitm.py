@@ -247,7 +247,9 @@ def eval_bitm_t2m(out_dir, val_loader, net, bitm, logger, writer, nb_iter, eval_
     matching_score_pred = 0.
 
     for batch in tqdm(val_loader, position=1, leave=True):
-        word_embeddings, pos_one_hots, sent_len, _, pose, m_length, token_ids_t, seq_mask_t, _ = batch
+        # BiTM text eval may append multi-reference captions; T2M only needs the
+        # original first 9 fields, so keep this path backward-compatible.
+        word_embeddings, pos_one_hots, sent_len, _, pose, m_length, token_ids_t, seq_mask_t, _ = batch[:9]
         bs, seq = pose.shape[:2]
         lens_m = torch.ceil(m_length / 4).long()
         pred_len = m_length.cuda()
