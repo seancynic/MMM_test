@@ -12,13 +12,17 @@ try:
     from nlgmetricverse import NLGMetricverse, load_metric
     import nlgmetricverse.metrics._core.base as nlg_base
     import nlgmetricverse.metrics._core.utils as nlg_utils
+    from nlgmetricverse.tokenizer import DefaultTokenizer as NLGDefaultTokenizer
     from nlgmetricverse.utils.string import normalize_text as nlg_normalize_text
+    from nlgmetricverse.utils.data_structure import NestedSingleType
 except ImportError:
     NLGMetricverse = None
     load_metric = None
     nlg_base = None
     nlg_utils = None
+    NLGDefaultTokenizer = None
     nlg_normalize_text = None
+    NestedSingleType = None
 else:
     def _safe_import_module(module_name, filepath):
         module = sys.modules.get(module_name)
@@ -39,11 +43,40 @@ else:
     nlg_utils.import_module = _safe_import_module
     nlg_base.import_module = _safe_import_module
 
+    def _safe_get_type(cls, obj, order=None):
+        _obj = obj
+        types = []
+
+        while cls.is_iterable(_obj):
+            types.append(type(_obj).__name__)
+            if len(_obj) == 0:
+                if order is not None:
+                    try:
+                        return types[order]
+                    except IndexError:
+                        return None
+                return cls.join(types)
+            _obj = _obj[0]
+
+        types.append(type(_obj).__name__)
+
+        if order is not None:
+            try:
+                return types[order]
+            except IndexError:
+                return None
+
+        return cls.join(types)
+
+    NestedSingleType.get_type = classmethod(_safe_get_type)
+
 try:
     # the bert_score package exposes a `score` function
     from bert_score import score as bert_score
 except ImportError:
     bert_score = None
+
+nlg_default_tokenizer = NLGDefaultTokenizer() if NLGDefaultTokenizer is not None else None
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -402,7 +435,11 @@ def prepare_text_metric_inputs(predictions, references):
 
     for pred, refs in zip(predictions, references):
         pred = "" if pred is None else pred.strip()
-        pred_norm = pred if nlg_normalize_text is None else nlg_normalize_text(pred)
+        if nlg_default_tokenizer is not None:
+            pred_tokens = nlg_default_tokenizer.tokenize(pred)
+        else:
+            pred_norm = pred if nlg_normalize_text is None else nlg_normalize_text(pred)
+            pred_tokens = pred_norm.split()
 
         refs = [] if refs is None else list(refs)
         clean_refs = []
@@ -412,15 +449,19 @@ def prepare_text_metric_inputs(predictions, references):
             ref = ref.strip()
             if not ref:
                 continue
-            ref_norm = ref if nlg_normalize_text is None else nlg_normalize_text(ref)
-            if not ref_norm.split():
+            if nlg_default_tokenizer is not None:
+                ref_tokens = nlg_default_tokenizer.tokenize(ref)
+            else:
+                ref_norm = ref if nlg_normalize_text is None else nlg_normalize_text(ref)
+                ref_tokens = ref_norm.split()
+            if not ref_tokens:
                 continue
             clean_refs.append(ref)
 
-        # nlgmetricverse normalizes punctuation away before tokenization.
-        # Strings like "." or "!!!" become empty token lists and crash its
-        # `collapse()` path, so filter with the same normalization rule.
-        if not pred_norm.split() or len(clean_refs) == 0:
+        # Filter using the same tokenizer nlgmetricverse BLEU uses internally.
+        # This removes strings that look non-empty but become empty token lists
+        # after punctuation normalization, e.g. "." or "!!!".
+        if not pred_tokens or len(clean_refs) == 0:
             skipped += 1
             continue
 
@@ -429,43 +470,41 @@ def prepare_text_metric_inputs(predictions, references):
 
     return clean_predictions, clean_references, skipped
 
-def inference_m2t(model, token_ids_m, seq_mask_m, special_ids_t, shape, rand_pos=True, token_cond=None, max_steps=10):
-    batch_size, max_t = shape
-    device = token_ids_m.device
-    max_length = max_t - 1
-
-    # Full-horizon generation: only [CLS] is reserved.
-    seq_mask_t = torch.ones(shape, dtype=torch.bool, device=device)
-    valid_text_mask = torch.ones(shape, dtype=torch.bool, device=device)
-    valid_text_mask[:, 0] = False
-
+def inference_m2t(model, lens_t: torch.Tensor, token_ids_m, seq_mask_m, seq_mask_t, seq_mask_no_end_t,
+             special_ids_t, max_length, shape, rand_pos=True, token_cond=None, max_steps=10):
     # init sampling score
-    scores = valid_text_mask.float()
+    scores = torch.ones(shape, dtype=torch.float32, device=lens_t.device)
 
     # init text token ids
     if token_cond is not None:  # has partial condition
         token_ids_t = token_cond.clone()
-        token_ids_t[:, 0] = special_ids_t['cls_id']
-        num_token_cond = (token_ids_t == special_ids_t['mask_id']).sum(-1).clamp(min=1)
+        token_ids_t[~seq_mask_no_end_t] = special_ids_t['pad_id']
+        num_token_cond = (token_ids_t == special_ids_t['mask_id']).sum(-1)
     else:  # start from full mask
-        token_ids_t = torch.full(shape, special_ids_t['mask_id'], dtype=torch.long, device=device)
+        token_ids_t = torch.full(shape, special_ids_t['mask_id'], dtype=torch.long, device=lens_t.device)
         token_ids_t[:, 0] = special_ids_t['cls_id']  # add [CLS] token for text
 
+    sample_max_steps = torch.round(max_steps / max_length * lens_t) + 1e-8
     for step in range(max_steps):
-        timestep = torch.full((batch_size,), step / max_steps, dtype=torch.float32, device=device)
+        timestep = torch.clip(step / sample_max_steps, max=1)
+        if len(lens_t) == 1 and step > 0 and torch.clip((step - 1) / sample_max_steps, max=1).cpu().item() == timestep:
+            break
         rand_mask_prob = cosine_schedule(timestep)
-        num_token_masked = (rand_mask_prob * max_length).long().clip(min=1)
+        num_token_masked = (rand_mask_prob * lens_t).long().clip(min=1)
 
         if token_cond is not None:
             num_token_masked = (rand_mask_prob * num_token_cond).long().clip(min=1)
             scores[token_cond != special_ids_t['mask_id']] = 0
 
-        # Only sample over non-CLS positions that are still active.
-        scores[~valid_text_mask] = 0
+        # Set sampling score to 0 for [PAD] and [CLS]
+        scores[~seq_mask_no_end_t] = 0
         scores[:, 0] = 0
         scores = scores / scores.sum(-1)[:, None]  # normalize only unmasked token
 
         _, sorted_score_indices = scores.sort(descending=True)  # deterministic
+
+        token_ids_t[~seq_mask_t] = special_ids_t['pad_id']  # replace with pad id
+        token_ids_t.scatter_(-1, lens_t[..., None].long(), special_ids_t['eos_id'])  # replace with end id
 
         # replace "mask_id" to "ids" that have highest "num_token_masked" "scores"
         select_masked_indices = generate_src_mask(sorted_score_indices.shape[1], num_token_masked)
@@ -529,14 +568,25 @@ def eval_bitm_m2t(out_dir, val_loader, bitm, logger, writer, nb_iter, tokenizer,
         bs, seq = pose.shape[:2]
         lens_m = torch.ceil(m_length / 4).long()
 
+        # Restore the previous oracle-length evaluation so we can isolate the
+        # metric-protocol change from the generation-length change.
+        t_valid_mask = ~torch.isin(token_ids_t.cuda(), torch.tensor(invalid_ids).cuda())
+        lens_t = t_valid_mask.sum(dim=1)
+
         # Get motion mask
         seq_mask_m = generate_src_mask(max_m, lens_m + 1)
+        seq_mask_eval_t = generate_src_mask(max_t, lens_t + 1)
+        seq_mask_no_end_t = generate_src_mask(max_t, lens_t)
 
         for i in range(num_repeat):
             index_text = inference_m2t(bitm,
+                                       lens_t=lens_t.cuda(),
                                        token_ids_m=token_ids_m.cuda(),
                                        seq_mask_m=seq_mask_m.cuda(),
+                                       seq_mask_t=seq_mask_eval_t.cuda(),
+                                       seq_mask_no_end_t=seq_mask_no_end_t.cuda(),
                                        special_ids_t=special_ids_t,
+                                       max_length=max_t - 1,
                                        shape=(bs, max_t),
                                        rand_pos=rand_pos)  # (bs, max_t)
             pred_text = decode_token_ids(index_text, tokenizer, eos_id=special_ids_t['eos_id'])
