@@ -13,13 +13,18 @@ from torch.utils.data import Dataset, DataLoader
 
 def collate_fn(batch):
     batch.sort(key=lambda x: x[3], reverse=True)
+    if len(batch[0]) == 10:
+        all_captions = [b[9] for b in batch]
+        batch = [b[:9] for b in batch]
+        collated = default_collate(batch)
+        return (*collated, all_captions)
     return default_collate(batch)
 
 
 '''For use of training text-2-motion generative model'''
 class Text2MotionDataset(Dataset):
     def __init__(self, dataset_name, is_test, w_vectorizer, tokenizer_name, codebook_size,
-                 max_text_len=20, unit_length=4, shuffle=True, up_low_sep=False):
+                 max_text_len=20, unit_length=4, shuffle=True, up_low_sep=False, return_all_captions=False):
         
         self.max_length = 20
         self.pointer = 0
@@ -29,6 +34,7 @@ class Text2MotionDataset(Dataset):
         self.max_text_len = max_text_len
         self.unit_length = unit_length
         self.w_vectorizer = w_vectorizer
+        self.return_all_captions = return_all_captions
 
         self.mot_end_idx = codebook_size
         self.mot_pad_idx = codebook_size + 1 # [TODO] I think 513 (codebook_size+1) can be what ever, it will be croped out
@@ -171,6 +177,17 @@ class Text2MotionDataset(Dataset):
         # data = self.data_dict[self.name_list[idx]]
         m_token_list, motion, m_length, text_list = data['m_token_list'], data['motion'], data['length'], data['text']
         m_tokens = random.choice(m_token_list)
+
+        all_captions = None
+        if self.return_all_captions:
+            all_captions = [' '.join(token.split('/')[0] for token in text_dic['tokens']) for text_dic in text_list]
+            if len(all_captions) > 3:
+                all_captions = all_captions[:3]
+            elif len(all_captions) == 2:
+                all_captions = all_captions + all_captions[:1]
+            elif len(all_captions) == 1:
+                all_captions = all_captions * 3
+
         # Randomly select a caption
         text_data = random.choice(text_list)
         caption, tokens = text_data['caption'], text_data['tokens']
@@ -241,7 +258,10 @@ class Text2MotionDataset(Dataset):
         if m_length < self.max_frame_length and self.shuffle:
             motion = np.concatenate([motion, np.zeros((self.max_frame_length - m_length, motion.shape[1]))], axis=0)
 
-        return word_embeddings, pos_one_hots, caption, sent_len, m_tokens, motion, m_length, '_'.join(tokens), name
+        sample = (word_embeddings, pos_one_hots, caption, sent_len, m_tokens, motion, m_length, '_'.join(tokens), name)
+        if self.return_all_captions:
+            return (*sample, all_captions)
+        return sample
 
 
 '''For use of training text-2-motion generative model'''
@@ -444,6 +464,10 @@ def collate_fn_with_bert(tokenizer_t, max_t):
 
     def collate(batch):
         batch.sort(key=lambda x: x[3], reverse=True)
+        all_captions = None
+        if len(batch[0]) == 10:
+            all_captions = [b[9] for b in batch]
+            batch = [b[:9] for b in batch]
         collated = default_collate(batch)
 
         word_embeddings, pos_one_hots, captions, sent_len, m_tokens, pose, m_length, _, _ = collated
@@ -451,15 +475,21 @@ def collate_fn_with_bert(tokenizer_t, max_t):
         with torch.no_grad():
             inputs = tokenizer_t(captions, padding='max_length', truncation=True, max_length=max_t, return_tensors='pt')
 
-        return word_embeddings, pos_one_hots, sent_len, m_tokens, pose, m_length, inputs['input_ids'], inputs['attention_mask'], captions
+        output = (word_embeddings, pos_one_hots, sent_len, m_tokens, pose, m_length, inputs['input_ids'], inputs['attention_mask'], captions)
+        if all_captions is not None:
+            return (*output, all_captions)
+        return output
 
     return collate
 
 def DATALoaderNew(dataset: str, tokenizer_m: str, w_vectorizer, codebook_size,
-                  batch_size=32, is_test=False, tokenizer_t=None, max_t=None, num_w=8, unit_length=4, shuffle=True):
+                  batch_size=32, is_test=False, tokenizer_t=None, max_t=None, num_w=8, unit_length=4, shuffle=True,
+                  return_all_captions=False):
     collate_function = collate_fn_with_bert(tokenizer_t, max_t) if tokenizer_t is not None else collate_fn
 
-    val_loader = DataLoader(Text2MotionDataset(dataset, is_test, w_vectorizer, tokenizer_m, codebook_size, unit_length=unit_length, shuffle=shuffle),
+    val_loader = DataLoader(Text2MotionDataset(dataset, is_test, w_vectorizer, tokenizer_m, codebook_size,
+                                               unit_length=unit_length, shuffle=shuffle,
+                                               return_all_captions=return_all_captions),
                             batch_size, shuffle=shuffle, num_workers=num_w, collate_fn=collate_function, drop_last=True)
 
     return val_loader

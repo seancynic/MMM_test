@@ -52,6 +52,7 @@ eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
 ##### ---- GloVe ---- #####
 from utils.word_vectorizer import WordVectorizer
+
 w_vectorizer = WordVectorizer('./glove', 'our_vab')
 
 ##### ---- BERT Tokenizer ---- #####
@@ -88,17 +89,17 @@ special_ids_m = {
 
 ##### ---- Text2Motion Transformer ---- #####
 bitm_model = BiTMBERT(bert_name=bert_name,
-                     vqvae=net,
-                     vocab_m=args.nb_code,
-                     max_t=args.max_t,
-                     max_m=args.max_m,
-                     first_modality=args.first_modality,
-                     dropout_rate=args.drop_out_rate)
+                      vqvae=net,
+                      vocab_m=args.nb_code,
+                      max_t=args.max_t,
+                      max_m=args.max_m,
+                      first_modality=args.first_modality,
+                      dropout_rate=args.drop_out_rate)
 
 if args.resume_trans is not None:
     print('loading transformer checkpoint from {}'.format(args.resume_trans))
     ckpt = torch.load(args.resume_trans, map_location='cpu')
-    bitm_model.load_state_dict(ckpt['trans'], strict=True)
+    bitm_model.load_state_dict(ckpt['bitm'], strict=True)
 bitm_model.to(device)
 bitm_model.train()
 bitm_model = torch.nn.DataParallel(bitm_model)
@@ -111,7 +112,8 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_s
 codebooks = {'train': codebook_train_dir, 'val': codebook_val_dir, 'test': codebook_test_dir}
 for type, codebook_dir in codebooks.items():
     if len(os.listdir(codebook_dir)) == 0:
-        dataloader_token = dataset_tokenize.DATALoaderNew(args.dataname, type=type, batch_size=1, unit_length=2 ** args.down_t)
+        dataloader_token = dataset_tokenize.DATALoaderNew(args.dataname, type=type, batch_size=1,
+                                                          unit_length=2 ** args.down_t)
         for batch in dataloader_token:
             pose, name = batch
             pose = pose.to(device).float()  # bs, nb_joints, joints_dim, seq_len
@@ -120,8 +122,10 @@ for type, codebook_dir in codebooks.items():
             np.save(os.path.join(codebook_dir, f'{name[0]}.npy'), target)
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, args.nb_code, args.batch_size, unit_length=2 ** args.down_t)
+train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir, args.nb_code, args.batch_size,
+                                              unit_length=2 ** args.down_t)
 train_loader_iter = dataset_TM_train.cycle(train_loader)
+
 
 ##### ---- Evaluation ---- #####
 def compute_result(pred_seq_masked, target, seq_mask_no_end):
@@ -130,6 +134,7 @@ def compute_result(pred_seq_masked, target, seq_mask_no_end):
     right_seq_masked = (pred_seq_masked_index == target_seq_masked).sum()  # compare with label
 
     return right_seq_masked
+
 
 def get_acc(cls_pred, target, mask):
     # Only look at the indices where mask is True
@@ -142,6 +147,7 @@ def get_acc(cls_pred, target, mask):
     # Calculate accuracy
     correct = (predictions == active_targets).float().sum()
     return (correct / mask.sum()) * 100
+
 
 ##### ---- Masking ---- #####
 def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, probs: list = None, no_corruption: bool = False):
@@ -161,7 +167,8 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, probs: list = None
         r_indices = torch.randint(0, get_model(bitm_model).bert.config.vocab_size, ids.shape, device=curr_device)
     else:
         if no_corruption:
-            return ids, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), torch.zeros_like(ids, dtype=torch.bool)
+            return ids, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), torch.zeros_like(ids,
+                                                                                                                    dtype=torch.bool)
         r_indices = torch.randint(0, args.nb_code, ids.shape, device=curr_device)
 
     corrupt_selector = torch.logical_and(~mask, seq_mask_no_end)
@@ -195,15 +202,18 @@ def masking(ids, seq_lens: torch.Tensor, batch_size, max_len, probs: list = None
         return masked_input_indices, seq_mask_no_end, mask_token
     else:
         masked_input_indices = input_indices.masked_fill(mask_token, special_ids_m['mask_id'])
-        return masked_input_indices, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(torch.int64), mask_token
+        return masked_input_indices, seq_mask_no_end, generate_src_mask(max_len, seq_lens + 1).to(
+            torch.int64), mask_token
 
-def task_routing_masking(token_ids_m, lens_m, probs_m: list, token_ids_t, lens_t, probs_t: list, batch_size, task_prob: float):
+
+def task_routing_masking(token_ids_m, lens_m, probs_m: list, token_ids_t, lens_t, probs_t: list, batch_size,
+                         task_prob: float):
     # 1. 生成任务分配掩码
     rand_tensor = torch.rand(batch_size, device=token_ids_m.device)
     is_mask_motion = rand_tensor < task_prob  # True: Mask Motion, False: Mask Text
     mask_m_indices = torch.nonzero(is_mask_motion, as_tuple=True)[0]
     mask_t_indices = torch.nonzero(~is_mask_motion, as_tuple=True)[0]
-    
+
     # 2. 得到各任务分别的 batch size
     sub_bs_mask_m = mask_m_indices.shape[0]
     sub_bs_mask_t = mask_t_indices.shape[0]
@@ -236,7 +246,9 @@ def task_routing_masking(token_ids_m, lens_m, probs_m: list, token_ids_t, lens_t
         final_ids_t.index_copy_(0, mask_t_indices, masked_t)
         final_mask_token_t.index_copy_(0, mask_t_indices, mask_tok_t)
 
-    return (final_ids_m, seq_mask_no_end_m, seq_mask_m, final_mask_token_m), (final_ids_t, seq_mask_no_end_t, final_mask_token_t)
+    return (final_ids_m, seq_mask_no_end_m, seq_mask_m, final_mask_token_m), (final_ids_t, seq_mask_no_end_t,
+                                                                              final_mask_token_t)
+
 
 ##### ---- Training ---- #####
 def get_pred_and_label(pred, ids, seq_mask_no_end):
@@ -248,9 +260,28 @@ def get_pred_and_label(pred, ids, seq_mask_no_end):
 
     return pred_seq_masked, target_seq_masked, weights_seq_masked
 
-def get_loss(pred_masked, target_masked, weights_masked):
-    loss = F.cross_entropy(pred_masked, target_masked, reduction='none')
-    return (loss * weights_masked).sum()
+
+def get_loss(pred, target, loss_mask):
+    """
+    pred: (B, L, V)
+    target: (B, L)
+    loss_mask: (B, L) bool, only True positions contribute loss
+    """
+    B, _, V = pred.shape
+    target = target.long()
+    flat_mask = loss_mask.reshape(-1)
+    if not flat_mask.any():
+        return pred.new_tensor(0.0)
+
+    pred_masked = pred.reshape(-1, V)[flat_mask]
+    target_masked = target.reshape(-1)[flat_mask]
+    ce_masked = F.cross_entropy(pred_masked, target_masked, reduction='none')
+
+    # Keep the original per-sample weighting style, but only on masked positions.
+    denom = loss_mask.sum(dim=1, keepdim=True).clamp(min=1) * B
+    weights = (loss_mask.float() / denom).reshape(-1)[flat_mask]
+    return (ce_masked * weights).sum()
+
 
 def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     """
@@ -274,6 +305,11 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     valid_flat = valid_mask.reshape(-1)  # (B*L,) bool
     masked_flat = masked_mask.reshape(-1)  # (B*L,) bool
 
+    # No valid token for this branch (e.g., this modality is control-only in this batch).
+    if not valid_flat.any():
+        zero = pred.new_tensor(0.0)
+        return zero, zero, zero
+
     # -------- 2) 只取 valid token --------
     pred_valid = pred_flat[valid_flat]  # (N, V)
     target_valid = target_flat[valid_flat]  # (N,)
@@ -295,6 +331,7 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     loss_unmasked = (ce_valid[~masked_valid] * w_valid[~masked_valid]).sum()
 
     return loss_masked, loss_unmasked, loss_total
+
 
 def train(mask_probs, task_prob):
     # Get masking probabilities
@@ -337,20 +374,21 @@ def train(mask_probs, task_prob):
         lens_t = valid_mask_t.sum(dim=1)  # (bs,)
 
         # Mask with task routing
-        out_m, out_t = task_routing_masking(token_ids_m, lens_m, probs_m, token_ids_t, lens_t, probs_t, bs, task_prob=task_prob)
+        out_m, out_t = task_routing_masking(token_ids_m, lens_m, probs_m, token_ids_t, lens_t, probs_t, bs,
+                                            task_prob=task_prob)
         masked_input_ids_m, seq_mask_no_end_m, seq_mask_m, mask_token_m = out_m
         masked_input_ids_t, seq_mask_no_end_t, mask_token_t = out_t
-        
+
         # Train: forward
         logits = bitm_model(masked_input_ids_t, masked_input_ids_m, seq_mask_t, seq_mask_m)
 
         # Get predictions and targets
-        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(logits['logits_m'], token_ids_m, seq_mask_no_end_m)
-        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(logits['logits_t'], token_ids_t, seq_mask_no_end_t)
+        pred_valid_m, _, _ = get_pred_and_label(logits['logits_m'], token_ids_m, seq_mask_no_end_m)
+        pred_valid_t, _, _ = get_pred_and_label(logits['logits_t'], token_ids_t, seq_mask_no_end_t)
 
-        # Compute loss
-        loss_m = get_loss(pred_masked_m, target_masked_m, weights_masked_m)
-        loss_t = get_loss(pred_masked_t, target_masked_t, weights_masked_t)
+        # Compute loss: only masked tokens in routed target modality
+        loss_m = get_loss(logits['logits_m'], token_ids_m, mask_token_m)
+        loss_t = get_loss(logits['logits_t'], token_ids_t, mask_token_t)
         loss = loss_m + loss_t
 
         # Optimize
@@ -363,13 +401,13 @@ def train(mask_probs, task_prob):
             loss_m_masked, loss_m_unmasked, loss_m = split_weighted_ce_loss(
                 pred=logits['logits_m'],
                 target=token_ids_m,
-                valid_mask=seq_mask_no_end_m,
+                valid_mask=mask_token_m,
                 masked_mask=mask_token_m
             )
             loss_t_masked, loss_t_unmasked, loss_t = split_weighted_ce_loss(
                 pred=logits['logits_t'],
                 target=token_ids_t,
-                valid_mask=seq_mask_no_end_t,
+                valid_mask=mask_token_t,
                 masked_mask=mask_token_t
             )
 
@@ -384,8 +422,8 @@ def train(mask_probs, task_prob):
             writer.add_scalar('./Loss/all', loss, nb_iter)
 
             # [INFO] log accuracy
-            right_masked_m = compute_result(pred_masked_m, token_ids_m, seq_mask_no_end_m)
-            right_masked_t = compute_result(pred_masked_t, token_ids_t, seq_mask_no_end_t)
+            right_masked_m = compute_result(pred_valid_m, token_ids_m, seq_mask_no_end_m)
+            right_masked_t = compute_result(pred_valid_t, token_ids_t, seq_mask_no_end_t)
             writer.add_scalar('./ACC/every_motion', right_masked_m * 100 / seq_mask_no_end_m.sum(), nb_iter)
             writer.add_scalar('./ACC/every_text', right_masked_t * 100 / seq_mask_no_end_t.sum(), nb_iter)
 
@@ -393,25 +431,28 @@ def train(mask_probs, task_prob):
             no_mask_token_m = ~mask_token_m * seq_mask_no_end_m
             no_mask_token_t = ~mask_token_t * seq_mask_no_end_t
             writer.add_scalar('./ACC/masked_motion', get_acc(logits['logits_m'], token_ids_m, mask_token_m), nb_iter)
-            writer.add_scalar('./ACC/no_masked_motion', get_acc(logits['logits_m'], token_ids_m, no_mask_token_m), nb_iter)
+            writer.add_scalar('./ACC/no_masked_motion', get_acc(logits['logits_m'], token_ids_m, no_mask_token_m),
+                              nb_iter)
             writer.add_scalar('./ACC/masked_text', get_acc(logits['logits_t'], token_ids_t, mask_token_t), nb_iter)
-            writer.add_scalar('./ACC/no_masked_text', get_acc(logits['logits_t'], token_ids_t, no_mask_token_t), nb_iter)
+            writer.add_scalar('./ACC/no_masked_text', get_acc(logits['logits_t'], token_ids_t, no_mask_token_t),
+                              nb_iter)
 
         if nb_iter == 0 or nb_iter % args.eval_iter == 0 or nb_iter == args.total_iter:
             # Test
             if nb_iter == args.total_iter:
                 num_repeat = -30
                 rand_pos = True
-                data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer, args.nb_code,
-                                                           batch_size=32, is_test=True, tokenizer_t=tokenizer,
-                                                           max_t=args.max_t, return_all_captions=True)
+                data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_test_dir, w_vectorizer,
+                                                            args.nb_code,
+                                                            batch_size=32, is_test=True, tokenizer_t=tokenizer,
+                                                            max_t=args.max_t, return_all_captions=True)
             # Validation
             else:
                 num_repeat = 1
                 rand_pos = False
                 data_loader = dataset_TM_eval.DATALoaderNew(args.dataname, codebook_val_dir, w_vectorizer, args.nb_code,
-                                                           batch_size=32, is_test=False, tokenizer_t=tokenizer,
-                                                           max_t=args.max_t, return_all_captions=True)
+                                                            batch_size=32, is_test=False, tokenizer_t=tokenizer,
+                                                            max_t=args.max_t, return_all_captions=True)
             # T2M Evaluation
             best_iter_m, best_fid, best_div, best_top1, best_top2, best_top3, best_matching, best_multi = eval_bitm_t2m(
                 args.out_dir, data_loader, net, bitm_model, logger, writer, nb_iter, eval_wrapper, special_ids_m, max_m,
@@ -436,6 +477,7 @@ def train(mask_probs, task_prob):
                 logger.info(msg_final)
                 break
 
+
 # Training: mix training
 # ((prob_lower_bound_m, prob_upper_bound_m), (prob_lower_bound_t, prob_upper_bound_t))
-train(mask_probs=((0.5, 1), (0, 0)), task_prob=1.)
+train(mask_probs=((0, 1), (0, 1)), task_prob=0.2)
