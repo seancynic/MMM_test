@@ -250,6 +250,6 @@ def eval_only(max_steps_t2m, max_steps_m2t, schedule_func_t2m, schedule_func_m2t
     }
 
 bests = eval_only(max_steps_t2m=10,
-                  max_steps_m2t=30,
+                  max_steps_m2t=10,
                   schedule_func_t2m=cosine_schedule,
-                  schedule_func_m2t=linear_schedule)  # cosine_schedule or linear_schedule
+                  schedule_func_m2t=cosine_schedule)  # cosine_schedule or linear_schedule

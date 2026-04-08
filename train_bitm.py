@@ -202,9 +202,9 @@ train_loader = dataset_TM_train.DATALoaderNew(args.dataname, codebook_train_dir,
 train_loader_iter = dataset_TM_train.cycle(train_loader)
 
 ##### ---- Evaluation ---- #####
-def compute_result(pred_seq_masked, target, seq_mask_no_end):
+def compute_result(pred_seq_masked, target, mask_token):
     pred_seq_masked_index = pred_seq_masked.argmax(dim=-1)  # (num_valid,)
-    target_seq_masked = torch.masked_select(target, seq_mask_no_end)  # (num_valid,)
+    target_seq_masked = torch.masked_select(target, mask_token)  # (num_valid,)
     right_seq_masked = (pred_seq_masked_index == target_seq_masked).sum()  # compare with label
 
     return right_seq_masked
@@ -322,14 +322,17 @@ def task_routing_masking(token_ids_m, lens_m, probs_m: list, token_ids_t, lens_t
     return (final_ids_m, seq_mask_no_end_m, seq_mask_m, final_mask_token_m), (final_ids_t, seq_mask_no_end_t, final_mask_token_t)
 
 ##### ---- Training ---- #####
-def get_pred_and_label(pred, ids, seq_mask_no_end):
+def get_pred_and_label(pred, ids, seq_mask_no_end, mask_token=None):
+    # 确定参与 loss 计算的 mask：优先使用 mask_token，否则使用 seq_mask_no_end
+    loss_mask = mask_token if mask_token is not None else seq_mask_no_end
+    # 权重归一化：只对参与 loss 的 token 进行归一化
     # weights[i, j] = 1 / (num_valid * B)
-    weights = seq_mask_no_end / (seq_mask_no_end.sum(-1).unsqueeze(-1) * seq_mask_no_end.shape[0])
-    pred_seq_masked = pred[seq_mask_no_end]  # (num_valid, vocab(, Q))
-    target_seq_masked = ids[seq_mask_no_end]  # (num_valid(, Q))
-    weights_seq_masked = weights[seq_mask_no_end]  # (num_valid(, Q))
+    weights = loss_mask / (loss_mask.sum(-1).unsqueeze(-1) * loss_mask.shape[0])
+    pred_masked = pred[loss_mask]
+    target_masked = ids[loss_mask]
+    weights_masked = weights[loss_mask]
 
-    return pred_seq_masked, target_seq_masked, weights_seq_masked
+    return pred_masked, target_masked, weights_masked
 
 def get_loss(pred_masked, target_masked, weights_masked):
     loss = F.cross_entropy(pred_masked, target_masked, reduction='none')  # (num_valid(, Q))
@@ -369,10 +372,9 @@ def split_weighted_ce_loss(pred, target, valid_mask, masked_mask):
     # token-wise CE on valid positions only: (N,)
     ce_valid = F.cross_entropy(pred_valid, target_valid, reduction='none')
 
-    # -------- 3) 构造权重：每个 valid token 权重 = 1/(num_valid_i * B) --------
-    # 先做一个 (B,L) 的 weights，再 flatten 到 valid
-    denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1) * B  # (B,1)
-    weights = (valid_mask.float() / denom)  # (B,L)
+    # -------- 3) 构造权重：每个 masked tokens 权重 = 1/(num_valid_i * B) --------
+    denom = masked_mask.sum(dim=1, keepdim=True).clamp(min=1) * B  # (B,1) 只在 masked 上归一化
+    weights = (masked_mask.float() / denom)  # (B,L)
     w_valid = weights.reshape(-1)[valid_flat]  # (N,)
 
     # -------- 4) 加权求和，并按 masked/unmasked 拆分 --------
@@ -430,9 +432,11 @@ def train(mask_probs, task_prob, split_loss):
         # Train: forward
         logits = bitm_model(masked_input_ids_t, masked_input_ids_m, seq_mask_t, seq_mask_m)
 
-        # Get predictions and targets
-        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(logits['logits_m'], token_ids_m, seq_mask_no_end_m)
-        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(logits['logits_t'], token_ids_t, seq_mask_no_end_t)
+        # Get predictions and targets (only masked tokens)
+        pred_masked_m, target_masked_m, weights_masked_m = get_pred_and_label(
+            logits['logits_m'], token_ids_m, seq_mask_no_end_m, mask_token_m)
+        pred_masked_t, target_masked_t, weights_masked_t = get_pred_and_label(
+            logits['logits_t'], token_ids_t, seq_mask_no_end_t, mask_token_t)
 
         # Compute loss
         loss_m = get_loss(pred_masked_m, target_masked_m, weights_masked_m)
@@ -469,11 +473,11 @@ def train(mask_probs, task_prob, split_loss):
                 writer.add_scalar('./Loss/text', loss_t, nb_iter)
                 writer.add_scalar('./Loss/all', loss, nb_iter)
 
-            # [INFO] log accuracy
-            right_masked_m = compute_result(pred_masked_m, token_ids_m, seq_mask_no_end_m)
-            right_masked_t = compute_result(pred_masked_t, token_ids_t, seq_mask_no_end_t)
-            writer.add_scalar('./ACC/every_motion', right_masked_m * 100 / seq_mask_no_end_m.sum(), nb_iter)
-            writer.add_scalar('./ACC/every_text', right_masked_t * 100 / seq_mask_no_end_t.sum(), nb_iter)
+            # [INFO] log accuracy (only masked tokens)
+            right_masked_m = compute_result(pred_masked_m, token_ids_m, mask_token_m)
+            right_masked_t = compute_result(pred_masked_t, token_ids_t, mask_token_t)
+            writer.add_scalar('./ACC/every_motion', right_masked_m * 100 / mask_token_m.sum(), nb_iter)
+            writer.add_scalar('./ACC/every_text', right_masked_t * 100 / mask_token_t.sum(), nb_iter)
 
             # [INFO] log mask/nomask
             no_mask_token_m = ~mask_token_m * seq_mask_no_end_m
