@@ -46,6 +46,10 @@ def get_args_parser():
     parser.add_argument("--ff-rate", type=int, default=4, help="feedforward size")
     parser.add_argument("--drop-out-rate", type=float, default=0.1, help="dropout ratio in the pos encoding")
     parser.add_argument("--first-modality", type=str, default='text', help="first modality")
+    parser.add_argument("--motion-encoder-layers", type=int, default=2, help="number of motion encoder layers")
+    parser.add_argument("--motion-decoder-layers", type=int, default=2, help="number of motion decoder layers")
+    parser.add_argument("--min-batch-per-gpu", type=int, default=32,
+                        help="only enable DataParallel when batch_size / visible_gpus is at least this value; set 0 to always use all visible GPUs")
     
     ## quantizer
     parser.add_argument("--quantizer", type=str, default='ema_reset', choices = ['ema', 'orig', 'ema_reset', 'reset'], help="eps for optimal transport")

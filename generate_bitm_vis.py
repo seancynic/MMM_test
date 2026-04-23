@@ -71,6 +71,8 @@ class MMM_BiTM(torch.nn.Module):
             max_m=args.max_m,
             first_modality=args.first_modality,
             dropout_rate=args.drop_out_rate,
+            motion_encoder_layers=args.motion_encoder_layers,
+            motion_decoder_layers=args.motion_decoder_layers,
         )
         if args.resume_trans is None:
             raise ValueError("args.resume_trans 为空：请传 bitm 的 checkpoint 路径（例如 net_last.pth / net_last_t.pth）")

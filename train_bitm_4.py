@@ -12,7 +12,7 @@ from options.get_eval_option import get_opt
 from models.evaluator_wrapper import EvaluatorModelWrapper
 from models.bitm import BiTMBERT
 from dataset import dataset_TM_train, dataset_TM_eval, dataset_tokenize
-from exit.utils import get_model, generate_src_mask, init_save_folder
+from exit.utils import get_model, generate_src_mask, init_save_folder, maybe_data_parallel
 from utils.eval_bitm import eval_bitm_t2m, eval_bitm_m2t
 
 from tqdm import tqdm
@@ -107,7 +107,9 @@ bitm_model = BiTMBERT(bert_name=bert_name,
                       max_t=args.max_t,
                       max_m=args.max_m,
                       first_modality=args.first_modality,
-                      dropout_rate=args.drop_out_rate)
+                      dropout_rate=args.drop_out_rate,
+                      motion_encoder_layers=args.motion_encoder_layers,
+                      motion_decoder_layers=args.motion_decoder_layers)
 
 if args.resume_trans is not None:
     print('loading transformer checkpoint from {}'.format(args.resume_trans))
@@ -117,10 +119,21 @@ bitm_model.to(device)
 frozen_bert_params = freeze_bert_backbone(bitm_model)
 bitm_model.train()
 keep_frozen_bert_eval(bitm_model)
-bitm_model = torch.nn.DataParallel(bitm_model)
+bitm_model, parallel_info = maybe_data_parallel(
+    bitm_model,
+    batch_size=args.batch_size,
+    min_batch_per_gpu=args.min_batch_per_gpu,
+    logger=logger
+)
 keep_frozen_bert_eval(bitm_model)
 trainable_params = sum(param.numel() for param in get_model(bitm_model).parameters() if param.requires_grad)
 logger.info(f'Freeze BERT backbone: {frozen_bert_params:,} params frozen, {trainable_params:,} params remain trainable.')
+logger.info(
+    f"Runtime parallelism: visible_gpus={parallel_info['visible_gpus']}, "
+    f"used_gpus={parallel_info['used_gpus']}, "
+    f"batch_per_gpu={parallel_info['batch_per_gpu']:.1f}, "
+    f"data_parallel={parallel_info['data_parallel']}."
+)
 
 ##### ---- Optimizer & Scheduler ---- #####
 optimizer = utils_model.initial_optim(args.decay_option, args.lr, args.weight_decay, bitm_model, args.optimizer)
