@@ -13,6 +13,53 @@ import datetime
 import os
 import math
 
+
+def maybe_data_parallel(model, batch_size, min_batch_per_gpu=32, logger=None):
+    if not torch.cuda.is_available():
+        info = {
+            'visible_gpus': 0,
+            'used_gpus': 0,
+            'batch_per_gpu': float(batch_size),
+            'data_parallel': False,
+        }
+        return model, info
+
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus <= 1:
+        info = {
+            'visible_gpus': visible_gpus,
+            'used_gpus': visible_gpus,
+            'batch_per_gpu': float(batch_size),
+            'data_parallel': False,
+        }
+        return model, info
+
+    batch_per_gpu = batch_size / visible_gpus
+    if min_batch_per_gpu > 0 and batch_per_gpu < min_batch_per_gpu:
+        if logger is not None:
+            logger.warning(
+                f"{visible_gpus} GPUs are visible, but batch_size={batch_size} gives only {batch_per_gpu:.1f} "
+                f"samples/GPU (< min_batch_per_gpu={min_batch_per_gpu}). "
+                f"Keeping single-GPU training to avoid DataParallel under-utilization. "
+                f"Increase batch_size or reduce visible GPUs to use multi-GPU efficiently."
+            )
+        info = {
+            'visible_gpus': visible_gpus,
+            'used_gpus': 1,
+            'batch_per_gpu': float(batch_size),
+            'data_parallel': False,
+        }
+        return model, info
+
+    wrapped_model = torch.nn.DataParallel(model)
+    info = {
+        'visible_gpus': visible_gpus,
+        'used_gpus': visible_gpus,
+        'batch_per_gpu': batch_per_gpu,
+        'data_parallel': True,
+    }
+    return wrapped_model, info
+
 kit_bone = [[0, 11], [11, 12], [12, 13], [13, 14], [14, 15], [0, 16], [16, 17], [17, 18], [18, 19], [19, 20], [0, 1], [1, 2], [2, 3], [3, 4], [3, 5], [5, 6], [6, 7], [3, 8], [8, 9], [9, 10]]
 t2m_bone = [[0,2], [2,5],[5,8],[8,11],
             [0,1],[1,4],[4,7],[7,10],

@@ -110,21 +110,47 @@ class TextHead(nn.Module):
 
 
 class BiTMBERT(nn.Module):
-    def __init__(self, bert_name, vqvae, vocab_m, max_t, max_m, first_modality, dropout_rate):
+    def __init__(self, bert_name, vqvae, vocab_m, max_t, max_m, first_modality, dropout_rate,
+                 motion_encoder_layers=2, motion_decoder_layers=2):
         super().__init__()
         # Backbone
         self.bert = BertModel.from_pretrained(bert_name)
         # Text Head
         self.text_head = TextHead(self.bert.config.hidden_size, self.bert.config.vocab_size)
         # Motion Encoder and Decoder
-        self.motion_encoder = MotionEncoder(vqvae, self.bert.config.hidden_size, dropout=dropout_rate)
-        self.motion_decoder = MotionDecoder(vocab_m, self.bert.config.hidden_size, dropout=dropout_rate)
+        self.motion_encoder = MotionEncoder(
+            vqvae,
+            self.bert.config.hidden_size,
+            num_layers=motion_encoder_layers,
+            dropout=dropout_rate
+        )
+        self.motion_decoder = MotionDecoder(
+            vocab_m,
+            self.bert.config.hidden_size,
+            num_layers=motion_decoder_layers,
+            dropout=dropout_rate
+        )
 
         self.max_t = max_t
         self.max_m = max_m
         self.fm = first_modality
 
-    def forward(self, text_ids, motion_ids, text_mask, motion_mask):
+    def forward_motion_only(self, motion_ids, motion_mask):
+        motion_embeds = self.motion_encoder(motion_ids, motion_mask)
+        bert_outputs = self.bert(inputs_embeds=motion_embeds, attention_mask=motion_mask, return_dict=True)
+        motion_embeds = bert_outputs.last_hidden_state
+        motion_logits = self.motion_decoder(motion_embeds, motion_mask)
+
+        return {
+            'logits_m': motion_logits,
+        }
+
+    def forward(self, text_ids=None, motion_ids=None, text_mask=None, motion_mask=None):
+        if text_ids is None or text_mask is None:
+            if motion_ids is None or motion_mask is None:
+                raise ValueError("motion_ids and motion_mask must be provided for motion-only forward.")
+            return self.forward_motion_only(motion_ids, motion_mask)
+
         # Get text and motion embeddings
         text_embeds = self.bert.embeddings.word_embeddings(text_ids)  # (batch, max_t, hidden_size)
         motion_embeds = self.motion_encoder(motion_ids, motion_mask)  # (batch, max_m, hidden_size)

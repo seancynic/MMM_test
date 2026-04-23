@@ -87,6 +87,19 @@ special_ids_m = {
     'end_id': args.nb_code,
 }
 
+
+def freeze_bert_backbone(model):
+    bert = get_model(model).bert
+    for param in bert.parameters():
+        param.requires_grad = False
+
+    return sum(param.numel() for param in bert.parameters())
+
+
+def keep_frozen_bert_eval(model):
+    get_model(model).bert.eval()
+
+
 ##### ---- Text2Motion Transformer ---- #####
 bitm_model = BiTMBERT(bert_name=bert_name,
                       vqvae=net,
@@ -103,13 +116,18 @@ if args.resume_trans is not None:
     ckpt = torch.load(args.resume_trans, map_location='cpu')
     bitm_model.load_state_dict(ckpt['bitm'], strict=True)
 bitm_model.to(device)
+frozen_bert_params = freeze_bert_backbone(bitm_model)
 bitm_model.train()
+keep_frozen_bert_eval(bitm_model)
 bitm_model, parallel_info = maybe_data_parallel(
     bitm_model,
     batch_size=args.batch_size,
     min_batch_per_gpu=args.min_batch_per_gpu,
     logger=logger
 )
+keep_frozen_bert_eval(bitm_model)
+trainable_params = sum(param.numel() for param in get_model(bitm_model).parameters() if param.requires_grad)
+logger.info(f'Freeze BERT backbone: {frozen_bert_params:,} params frozen, {trainable_params:,} params remain trainable.')
 logger.info(
     f"Runtime parallelism: visible_gpus={parallel_info['visible_gpus']}, "
     f"used_gpus={parallel_info['used_gpus']}, "
@@ -371,6 +389,7 @@ def train(mask_probs, task_prob):
         masked_input_ids_t, seq_mask_no_end_t, mask_token_t = out_t
 
         # Train: forward
+        keep_frozen_bert_eval(bitm_model)
         logits = bitm_model(masked_input_ids_t, masked_input_ids_m, seq_mask_t, seq_mask_m)
 
         # Get predictions and targets

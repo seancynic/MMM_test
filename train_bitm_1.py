@@ -12,7 +12,7 @@ from options.get_eval_option import get_opt
 from models.evaluator_wrapper import EvaluatorModelWrapper
 from models.bitm import BiTMBERT
 from dataset import dataset_TM_train, dataset_TM_eval, dataset_tokenize
-from exit.utils import get_model, generate_src_mask, init_save_folder
+from exit.utils import get_model, generate_src_mask, init_save_folder, maybe_data_parallel
 from utils.eval_bitm import eval_bitm_t2m, eval_bitm_m2t
 
 from tqdm import tqdm
@@ -88,12 +88,14 @@ special_ids_m = {
 
 ##### ---- Text2Motion Transformer ---- #####
 bitm_model = BiTMBERT(bert_name=bert_name,
-                     vqvae=net,
-                     vocab_m=args.nb_code,
-                     max_t=args.max_t,
-                     max_m=args.max_m,
-                     first_modality=args.first_modality,
-                     dropout_rate=args.drop_out_rate)
+                      vqvae=net,
+                      vocab_m=args.nb_code,
+                      max_t=args.max_t,
+                      max_m=args.max_m,
+                      first_modality=args.first_modality,
+                      dropout_rate=args.drop_out_rate,
+                      motion_encoder_layers=args.motion_encoder_layers,
+                      motion_decoder_layers=args.motion_decoder_layers)
 
 if args.resume_trans is not None:
     print('loading transformer checkpoint from {}'.format(args.resume_trans))
@@ -101,7 +103,18 @@ if args.resume_trans is not None:
     bitm_model.load_state_dict(ckpt['trans'], strict=True)
 bitm_model.to(device)
 bitm_model.train()
-bitm_model = torch.nn.DataParallel(bitm_model)
+bitm_model, parallel_info = maybe_data_parallel(
+    bitm_model,
+    batch_size=args.batch_size,
+    min_batch_per_gpu=args.min_batch_per_gpu,
+    logger=logger
+)
+logger.info(
+    f"Runtime parallelism: visible_gpus={parallel_info['visible_gpus']}, "
+    f"used_gpus={parallel_info['used_gpus']}, "
+    f"batch_per_gpu={parallel_info['batch_per_gpu']:.1f}, "
+    f"data_parallel={parallel_info['data_parallel']}."
+)
 
 ##### ---- Optimizer & Scheduler ---- #####
 optimizer = utils_model.initial_optim(args.decay_option, args.lr, args.weight_decay, bitm_model, args.optimizer)

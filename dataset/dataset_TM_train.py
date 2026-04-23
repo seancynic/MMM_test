@@ -16,12 +16,14 @@ def collate_fn(batch):
 
 '''For use of training text-2-motion generative model'''
 class Text2MotionDataset(Dataset):
-    def __init__(self, dataset_name, tokenizer_name, codebook_size, unit_length=4, up_low_sep=False):
+    def __init__(self, dataset_name, tokenizer_name, codebook_size, unit_length=4, up_low_sep=False,
+                 split='train', return_caption=True):
         
         self.max_length = 64
         self.pointer = 0
         self.dataset_name = dataset_name
         self.up_low_sep = up_low_sep
+        self.return_caption = return_caption
 
         self.unit_length = unit_length
         # self.mot_start_idx = codebook_size
@@ -48,7 +50,7 @@ class Text2MotionDataset(Dataset):
             self.max_motion_length = 26 if unit_length == 8 else 50
             kinematic_chain = paramUtil.kit_kinematic_chain
 
-        split_file = pjoin(self.data_root, 'train.txt')
+        split_file = pjoin(self.data_root, f'{split}.txt')
 
         id_list = []
         with cs.open(split_file, 'r') as f:
@@ -143,7 +145,9 @@ class Text2MotionDataset(Dataset):
             else:
                 m_tokens = np.concatenate([m_tokens, np.ones((1), dtype=int) * self.mot_end_idx], axis=0)
 
-        return caption, m_tokens, m_tokens_len
+        if self.return_caption:
+            return caption, m_tokens, m_tokens_len
+        return m_tokens, m_tokens_len
 
 
 '''For use of training text-2-motion generative model'''
@@ -300,9 +304,23 @@ def DATALoader(dataset_name,
 
     return train_loader
 
-def DATALoaderNew(dataset_name, tokenizer_name, codebook_size, batch_size, unit_length=4, num_workers=8, up_low_sep=False):
-    train_loader = DataLoader(Text2MotionDataset(dataset_name, tokenizer_name, codebook_size, unit_length=unit_length, up_low_sep=up_low_sep),
-                              batch_size, shuffle=True, num_workers=num_workers, drop_last = True)
+def DATALoaderNew(dataset_name, tokenizer_name, codebook_size, batch_size, unit_length=4, num_workers=8,
+                  up_low_sep=False, split='train', return_caption=True, shuffle=True, drop_last=True):
+    train_loader = DataLoader(
+        Text2MotionDataset(
+            dataset_name,
+            tokenizer_name,
+            codebook_size,
+            unit_length=unit_length,
+            up_low_sep=up_low_sep,
+            split=split,
+            return_caption=return_caption
+        ),
+        batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last
+    )
 
     return train_loader
 
